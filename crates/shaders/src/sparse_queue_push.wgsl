@@ -48,8 +48,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         // 1. Cheap non-modifying check
         if (atomicLoad(&distances[v]) == INF) {
             // 2. Atomic claim: exactly one thread wins exchange
-            let res = atomicCompareExchangeWeak(&distances[v], INF, next_dist);
-            if (res.exchanged) {
+            let prev = atomicMin(&distances[v], next_dist);
+            if (prev == INF) {
                 // Winning thread enqueues v into next frontier
                 let slot = atomicAdd(&queue_sizes[1], 1u);
                 queue_out[slot] = v;

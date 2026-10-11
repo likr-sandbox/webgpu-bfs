@@ -8,6 +8,11 @@ use webgpu_bfs_gpu::{GpuBfsEngine, GpuBfsMethod, GpuContext};
 use crate::args::MethodArg;
 use crate::verify::{verify_engine_output, VerificationResult};
 
+enum BenchEngine {
+    Cpu(Box<dyn BfsEngine>),
+    Gpu(GpuBfsEngine),
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BenchmarkResult {
     pub method: String,
@@ -88,6 +93,8 @@ impl BenchmarkHarness {
                 MethodArg::SparseBitParallel64,
                 MethodArg::MultiWordBitParallel,
                 MethodArg::IndirectMacroBatch,
+                MethodArg::IndirectSparseQueuePush,
+                MethodArg::MultiWordBitParallelPush,
             ],
             single => vec![single],
         };
@@ -151,98 +158,122 @@ impl BenchmarkHarness {
         traversed_edges: usize,
         ground_truth_dist: &[u32],
     ) -> Result<BenchmarkResult> {
-        let (engine_box, method_name): (Box<dyn BfsEngine>, String) = match method {
+        let (engine, method_name) = match method {
             MethodArg::CpuReference => (
-                Box::new(CpuBfsEngine::rayon()),
+                BenchEngine::Cpu(Box::new(CpuBfsEngine::rayon())),
                 "CPU Reference (Rayon)".to_string(),
             ),
             MethodArg::CpuSingleThread => (
-                Box::new(CpuBfsEngine::fifo()),
+                BenchEngine::Cpu(Box::new(CpuBfsEngine::fifo())),
                 "CPU Single-Thread (FIFO)".to_string(),
             ),
             MethodArg::NaiveSequential => (
-                Box::new(GpuBfsEngine::new(
+                BenchEngine::Gpu(GpuBfsEngine::new(
                     self.context.clone(),
                     GpuBfsMethod::NaiveSequential,
                 )?),
                 "GPU NaiveSequential".to_string(),
             ),
             MethodArg::BatchedDenseSpMM => (
-                Box::new(GpuBfsEngine::new(
+                BenchEngine::Gpu(GpuBfsEngine::new(
                     self.context.clone(),
                     GpuBfsMethod::BatchedDenseSpMM,
                 )?),
                 "GPU BatchedDenseSpMM".to_string(),
             ),
             MethodArg::BitParallel32 => (
-                Box::new(GpuBfsEngine::new(
+                BenchEngine::Gpu(GpuBfsEngine::new(
                     self.context.clone(),
                     GpuBfsMethod::BitParallel32,
                 )?),
                 "GPU BitParallel32".to_string(),
             ),
             MethodArg::BitParallel64 => (
-                Box::new(GpuBfsEngine::new(
+                BenchEngine::Gpu(GpuBfsEngine::new(
                     self.context.clone(),
                     GpuBfsMethod::BitParallel64,
                 )?),
                 "GPU BitParallel64".to_string(),
             ),
             MethodArg::BitParallel64Pull => (
-                Box::new(GpuBfsEngine::new(
+                BenchEngine::Gpu(GpuBfsEngine::new(
                     self.context.clone(),
                     GpuBfsMethod::BitParallel64Pull,
                 )?),
                 "GPU BitParallel64Pull".to_string(),
             ),
             MethodArg::BooleanReachability => (
-                Box::new(GpuBfsEngine::new(
+                BenchEngine::Gpu(GpuBfsEngine::new(
                     self.context.clone(),
                     GpuBfsMethod::BooleanReachability,
                 )?),
                 "GPU BooleanReachability".to_string(),
             ),
             MethodArg::PushPullAdaptive => (
-                Box::new(GpuBfsEngine::new(
+                BenchEngine::Gpu(GpuBfsEngine::new(
                     self.context.clone(),
                     GpuBfsMethod::PushPullAdaptive,
                 )?),
                 "GPU PushPullAdaptive".to_string(),
             ),
             MethodArg::SparseQueue => (
-                Box::new(GpuBfsEngine::new(
+                BenchEngine::Gpu(GpuBfsEngine::new(
                     self.context.clone(),
                     GpuBfsMethod::SparseQueue,
                 )?),
                 "GPU SparseQueue".to_string(),
             ),
             MethodArg::SparseBitParallel64 => (
-                Box::new(GpuBfsEngine::new(
+                BenchEngine::Gpu(GpuBfsEngine::new(
                     self.context.clone(),
                     GpuBfsMethod::SparseBitParallel64,
                 )?),
                 "GPU SparseBitParallel64".to_string(),
             ),
             MethodArg::MultiWordBitParallel => (
-                Box::new(GpuBfsEngine::new(
+                BenchEngine::Gpu(GpuBfsEngine::new(
                     self.context.clone(),
                     GpuBfsMethod::MultiWordBitParallel,
                 )?),
                 "GPU MultiWordBitParallel".to_string(),
             ),
             MethodArg::IndirectMacroBatch => (
-                Box::new(GpuBfsEngine::new(
+                BenchEngine::Gpu(GpuBfsEngine::new(
                     self.context.clone(),
                     GpuBfsMethod::IndirectMacroBatch,
                 )?),
                 "GPU IndirectMacroBatch".to_string(),
             ),
+            MethodArg::IndirectSparseQueuePush => (
+                BenchEngine::Gpu(GpuBfsEngine::new(
+                    self.context.clone(),
+                    GpuBfsMethod::IndirectSparseQueuePush,
+                )?),
+                "GPU IndirectSparseQueuePush".to_string(),
+            ),
+            MethodArg::MultiWordBitParallelPush => (
+                BenchEngine::Gpu(GpuBfsEngine::new(
+                    self.context.clone(),
+                    GpuBfsMethod::MultiWordBitParallelPush,
+                )?),
+                "GPU MultiWordBitParallelPush".to_string(),
+            ),
             MethodArg::All => unreachable!(),
         };
 
+        let total_elements = sources.len() * graph.num_vertices;
+        let mut reusable_output = vec![0u32; total_elements];
+
         // A. Warm-up Phase
         for _ in 0..self.warmup {
-            let _ = engine_box.run_ms_bfs(graph, sources)?;
+            match &engine {
+                BenchEngine::Cpu(cpu) => {
+                    let _ = cpu.run_ms_bfs(graph, sources)?;
+                }
+                BenchEngine::Gpu(gpu) => {
+                    gpu.run_ms_bfs_into(graph, sources, &mut reusable_output)?;
+                }
+            }
         }
 
         // B. Timed Measurement Phase
@@ -251,10 +282,23 @@ impl BenchmarkHarness {
 
         for _ in 0..self.iters {
             let start = Instant::now();
-            let dist = engine_box.run_ms_bfs(graph, sources)?;
-            let elapsed = start.elapsed();
-            durations.push(elapsed);
-            last_output = dist;
+            match &engine {
+                BenchEngine::Cpu(cpu) => {
+                    let dist = cpu.run_ms_bfs(graph, sources)?;
+                    let elapsed = start.elapsed();
+                    durations.push(elapsed);
+                    last_output = dist;
+                }
+                BenchEngine::Gpu(gpu) => {
+                    gpu.run_ms_bfs_into(graph, sources, &mut reusable_output)?;
+                    let elapsed = start.elapsed();
+                    durations.push(elapsed);
+                }
+            }
+        }
+
+        if matches!(engine, BenchEngine::Gpu(_)) && self.iters > 0 {
+            last_output = reusable_output;
         }
 
         // C. Statistical Aggregation

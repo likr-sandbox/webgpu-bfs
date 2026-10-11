@@ -383,6 +383,24 @@ pub enum MethodArg {
     IndirectMacroBatch,
 
     #[value(
+        name = "IndirectSparseQueuePush",
+        alias = "indirect-sparse-push",
+        alias = "indirect-sparse",
+        alias = "indirect-queue",
+        alias = "isqp"
+    )]
+    IndirectSparseQueuePush,
+
+    #[value(
+        name = "MultiWordBitParallelPush",
+        alias = "multi-word-push",
+        alias = "mw-push",
+        alias = "multiword-push",
+        alias = "mw-bp-push"
+    )]
+    MultiWordBitParallelPush,
+
+    #[value(
         name = "CpuReference",
         alias = "cpu",
         alias = "cpu-ref",

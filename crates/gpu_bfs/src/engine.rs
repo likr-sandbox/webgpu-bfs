@@ -10,9 +10,13 @@ use crate::{
         batched_spmm::run_batched_spmm, bit_parallel_32::run_bit_parallel_32,
         bit_parallel_64::run_bit_parallel_64, bit_parallel_64_pull::run_bit_parallel_64_pull,
         boolean_reachability::run_boolean_reachability, indirect::run_indirect_macro_batch,
-        multi_word_bp::run_multi_word_bp, naive_seq::run_naive_sequential,
-        push_pull::run_push_pull_adaptive, push_pull::PushPullConfig,
-        sparse_bp::run_sparse_bp_64, sparse_queue::run_sparse_queue,
+        indirect_sparse_push::{
+            run_indirect_sparse_push_into, run_indirect_sparse_push_pooled,
+            PersistentSparsePushBuffers,
+        },
+        multi_word_bp::run_multi_word_bp, multi_word_push::run_multi_word_bp_push,
+        naive_seq::run_naive_sequential, push_pull::run_push_pull_adaptive,
+        push_pull::PushPullConfig, sparse_bp::run_sparse_bp_64, sparse_queue::run_sparse_queue,
     },
     pipeline::PipelineCache,
 };
@@ -32,6 +36,10 @@ pub enum GpuBfsMethod {
     SparseBitParallel64,
     MultiWordBitParallel,
     IndirectMacroBatch,
+    /// Milestone M12: Fused Indirect Sparse Queue Push for directed graphs (S=64).
+    IndirectSparseQueuePush,
+    /// Milestone M12: Multi-Word Bit-Parallel Push for massive batches (S >= 128..2048).
+    MultiWordBitParallelPush,
 }
 
 /// GPU Multi-Source BFS engine implementing `webgpu_bfs_core::BfsEngine`.
@@ -39,6 +47,7 @@ pub struct GpuBfsEngine {
     context: Arc<GpuContext>,
     pipelines: Arc<PipelineCache>,
     method: GpuBfsMethod,
+    persistent_isqp: std::sync::Mutex<Option<PersistentSparsePushBuffers>>,
 }
 
 impl GpuBfsEngine {
@@ -49,6 +58,7 @@ impl GpuBfsEngine {
             context,
             pipelines,
             method,
+            persistent_isqp: std::sync::Mutex::new(None),
         })
     }
 
@@ -108,6 +118,16 @@ impl GpuBfsEngine {
         Self::new(context, GpuBfsMethod::IndirectMacroBatch)
     }
 
+    /// Creates an engine using the `IndirectSparseQueuePush` method (Milestone M12).
+    pub fn indirect_sparse_queue_push(context: Arc<GpuContext>) -> Result<Self> {
+        Self::new(context, GpuBfsMethod::IndirectSparseQueuePush)
+    }
+
+    /// Creates an engine using the `MultiWordBitParallelPush` method (Milestone M12).
+    pub fn multi_word_bit_parallel_push(context: Arc<GpuContext>) -> Result<Self> {
+        Self::new(context, GpuBfsMethod::MultiWordBitParallelPush)
+    }
+
     /// Returns the active execution method.
     pub fn method(&self) -> GpuBfsMethod {
         self.method
@@ -116,6 +136,64 @@ impl GpuBfsEngine {
     /// Returns a reference to the underlying `GpuContext`.
     pub fn context(&self) -> &Arc<GpuContext> {
         &self.context
+    }
+
+    /// Executes MS-BFS directly into a caller-provided reusable destination buffer.
+    pub fn run_ms_bfs_into(
+        &self,
+        graph: &CsrGraph,
+        sources: &[u32],
+        out: &mut Vec<u32>,
+    ) -> Result<()> {
+        let num_vertices = graph.num_vertices;
+        let num_sources = sources.len();
+
+        if num_sources == 0 {
+            out.clear();
+            return Ok(());
+        }
+
+        if num_vertices == 0 {
+            bail!(
+                "Source vertex {} at index 0 exceeds graph vertex count 0",
+                sources[0]
+            );
+        }
+
+        for (i, &s) in sources.iter().enumerate() {
+            if s as usize >= num_vertices {
+                bail!(
+                    "Source vertex {} at index {} exceeds graph vertex count {}",
+                    s,
+                    i,
+                    num_vertices
+                );
+            }
+        }
+
+        let total = num_sources * num_vertices;
+        if out.len() != total {
+            out.resize(total, u32::MAX);
+        }
+
+        match self.method {
+            GpuBfsMethod::IndirectSparseQueuePush => {
+                let mut guard = self.persistent_isqp.lock().unwrap();
+                run_indirect_sparse_push_into(
+                    &self.context,
+                    &self.pipelines,
+                    graph,
+                    sources,
+                    Some(&mut *guard),
+                    out,
+                )
+            }
+            _ => {
+                let res = self.run_ms_bfs(graph, sources)?;
+                out.copy_from_slice(&res);
+                Ok(())
+            }
+        }
     }
 }
 
@@ -183,6 +261,19 @@ impl BfsEngine for GpuBfsEngine {
             }
             GpuBfsMethod::IndirectMacroBatch => {
                 run_indirect_macro_batch(&self.context, &self.pipelines, graph, sources)
+            }
+            GpuBfsMethod::IndirectSparseQueuePush => {
+                let mut guard = self.persistent_isqp.lock().unwrap();
+                run_indirect_sparse_push_pooled(
+                    &self.context,
+                    &self.pipelines,
+                    graph,
+                    sources,
+                    Some(&mut *guard),
+                )
+            }
+            GpuBfsMethod::MultiWordBitParallelPush => {
+                run_multi_word_bp_push(&self.context, &self.pipelines, graph, sources)
             }
         }
     }

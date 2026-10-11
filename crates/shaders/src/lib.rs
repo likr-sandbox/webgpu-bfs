@@ -48,6 +48,27 @@ pub const PREP_HOP_WGSL: &str = include_str!("prep_hop.wgsl");
 /// WGSL shader source for Indirect Bit-Parallel Pull traversal.
 pub const INDIRECT_BP_PULL_WGSL: &str = include_str!("indirect_bp_pull.wgsl");
 
+/// WGSL shader source for Indirect Sparse Push preparation kernel (Milestone M12).
+pub const PREP_SPARSE_PUSH_HOP_WGSL: &str = include_str!("prep_sparse_push_hop.wgsl");
+
+/// WGSL shader source for Fused Indirect Sparse Push traversal (Milestone M12).
+pub const INDIRECT_SPARSE_PUSH_WGSL: &str = include_str!("indirect_sparse_push.wgsl");
+
+/// WGSL shader source for Massive Multi-Word Bit-Parallel Push traversal (Milestone M12).
+pub const MULTI_WORD_BP_PUSH_WGSL: &str = include_str!("multi_word_bp_push.wgsl");
+
+/// WGSL shader source for Massive Multi-Word Bit-Parallel Filter & Distance Update (Milestone M12).
+pub const MULTI_WORD_BP_FILTER_WGSL: &str = include_str!("multi_word_bp_filter.wgsl");
+
+/// WGSL shader source for fast buffer reset to u32::MAX (0xFFFFFFFF).
+pub const RESET_BUFFER_U32_MAX_WGSL: &str = include_str!("reset_buffer_u32_max.wgsl");
+
+/// WGSL shader source for GPU source initialization for Sparse Push BFS.
+pub const INIT_SPARSE_PUSH_SOURCES_WGSL: &str = include_str!("init_sparse_push_sources.wgsl");
+
+/// WGSL shader source for packing u32 distances to u16 (Milestone M14).
+pub const PACK_DISTANCES_U32_TO_U16_WGSL: &str = include_str!("pack_distances_u32_to_u16.wgsl");
+
 /// Returns a slice of tuples containing (filename, shader_source) for all embedded shaders.
 pub fn all_shaders() -> &'static [(&'static str, &'static str)] {
     &[
@@ -66,6 +87,13 @@ pub fn all_shaders() -> &'static [(&'static str, &'static str)] {
         ("multi_word_bp_pull.wgsl", MULTI_WORD_BP_PULL_WGSL),
         ("prep_hop.wgsl", PREP_HOP_WGSL),
         ("indirect_bp_pull.wgsl", INDIRECT_BP_PULL_WGSL),
+        ("prep_sparse_push_hop.wgsl", PREP_SPARSE_PUSH_HOP_WGSL),
+        ("indirect_sparse_push.wgsl", INDIRECT_SPARSE_PUSH_WGSL),
+        ("multi_word_bp_push.wgsl", MULTI_WORD_BP_PUSH_WGSL),
+        ("multi_word_bp_filter.wgsl", MULTI_WORD_BP_FILTER_WGSL),
+        ("reset_buffer_u32_max.wgsl", RESET_BUFFER_U32_MAX_WGSL),
+        ("init_sparse_push_sources.wgsl", INIT_SPARSE_PUSH_SOURCES_WGSL),
+        ("pack_distances_u32_to_u16.wgsl", PACK_DISTANCES_U32_TO_U16_WGSL),
     ]
 }
 
@@ -166,5 +194,40 @@ mod tests {
     #[test]
     fn test_indirect_bp_pull_syntax() {
         validate_wgsl_shader("indirect_bp_pull.wgsl", INDIRECT_BP_PULL_WGSL);
+    }
+
+    #[test]
+    fn test_prep_sparse_push_hop_syntax() {
+        validate_wgsl_shader("prep_sparse_push_hop.wgsl", PREP_SPARSE_PUSH_HOP_WGSL);
+    }
+
+    #[test]
+    fn test_indirect_sparse_push_syntax() {
+        validate_wgsl_shader("indirect_sparse_push.wgsl", INDIRECT_SPARSE_PUSH_WGSL);
+    }
+
+    #[test]
+    fn test_multi_word_bp_push_syntax() {
+        validate_wgsl_shader("multi_word_bp_push.wgsl", MULTI_WORD_BP_PUSH_WGSL);
+    }
+
+    #[test]
+    fn test_multi_word_bp_filter_syntax() {
+        validate_wgsl_shader("multi_word_bp_filter.wgsl", MULTI_WORD_BP_FILTER_WGSL);
+    }
+
+    #[test]
+    fn test_reset_buffer_u32_max_syntax() {
+        validate_wgsl_shader("reset_buffer_u32_max.wgsl", RESET_BUFFER_U32_MAX_WGSL);
+    }
+
+    #[test]
+    fn test_init_sparse_push_sources_syntax() {
+        validate_wgsl_shader("init_sparse_push_sources.wgsl", INIT_SPARSE_PUSH_SOURCES_WGSL);
+    }
+
+    #[test]
+    fn test_pack_distances_u32_to_u16_syntax() {
+        validate_wgsl_shader("pack_distances_u32_to_u16.wgsl", PACK_DISTANCES_U32_TO_U16_WGSL);
     }
 }

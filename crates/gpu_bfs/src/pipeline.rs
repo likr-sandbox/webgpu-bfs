@@ -4,14 +4,19 @@ use anyhow::Result;
 use webgpu_bfs_shaders::{
     BATCHED_SPMM_WGSL, BIT_PARALLEL_64_PULL_WGSL, BIT_PARALLEL_64_PUSH_WGSL, BIT_PARALLEL_64_WGSL,
     BIT_PARALLEL_PULL_WGSL, BIT_PARALLEL_PUSH_WGSL, BOOLEAN_REACHABILITY_WGSL,
-    INDIRECT_BP_PULL_WGSL, MULTI_WORD_BP_PULL_WGSL, NAIVE_SPMV_WGSL, PREP_HOP_WGSL,
-    SPARSE_BP_FILTER_WGSL, SPARSE_BP_PUSH_WGSL, SPARSE_QUEUE_PUSH_WGSL,
+    INDIRECT_BP_PULL_WGSL, INDIRECT_SPARSE_PUSH_WGSL, INIT_SPARSE_PUSH_SOURCES_WGSL,
+    MULTI_WORD_BP_FILTER_WGSL, MULTI_WORD_BP_PULL_WGSL, MULTI_WORD_BP_PUSH_WGSL, NAIVE_SPMV_WGSL,
+    PREP_HOP_WGSL, PREP_SPARSE_PUSH_HOP_WGSL, RESET_BUFFER_U32_MAX_WGSL, SPARSE_BP_FILTER_WGSL,
+    SPARSE_BP_PUSH_WGSL, SPARSE_QUEUE_PUSH_WGSL, PACK_DISTANCES_U32_TO_U16_WGSL,
 };
 use wgpu::{
     BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType,
     BufferBindingType, ComputePipeline, ComputePipelineDescriptor, Device,
     PipelineLayoutDescriptor, ShaderModuleDescriptor, ShaderSource, ShaderStages,
 };
+
+/// Type alias for `PipelineCache` matching architectural specifications.
+pub type BfsPipelines = PipelineCache;
 
 /// Cache of precompiled compute pipelines and bind group layouts.
 #[derive(Debug)]
@@ -60,6 +65,28 @@ pub struct PipelineCache {
     prep_hop_pipeline: ComputePipeline,
     indirect_bp_pull_layout: BindGroupLayout,
     indirect_bp_pull_pipeline: ComputePipeline,
+
+    // Milestone 12: Fused Indirect Sparse Queue Push
+    prep_sparse_push_layout: BindGroupLayout,
+    prep_sparse_push_pipeline: ComputePipeline,
+    indirect_sparse_push_layout: BindGroupLayout,
+    indirect_sparse_push_pipeline: ComputePipeline,
+
+    // Milestone 12: Multi-Word Bit-Parallel Push
+    multi_word_push_layout: BindGroupLayout,
+    multi_word_push_pipeline: ComputePipeline,
+    multi_word_filter_layout: BindGroupLayout,
+    multi_word_filter_pipeline: ComputePipeline,
+
+    // Milestone 12: Fast GPU Buffer Reset & Source Initialization
+    reset_dist_layout: BindGroupLayout,
+    reset_dist_pipeline: ComputePipeline,
+    init_sparse_sources_layout: BindGroupLayout,
+    init_sparse_sources_pipeline: ComputePipeline,
+
+    // Milestone 14: Distance Quantization (u32 -> u16)
+    pack_distances_layout: BindGroupLayout,
+    pack_distances_pipeline: ComputePipeline,
 }
 
 impl PipelineCache {
@@ -301,6 +328,135 @@ impl PipelineCache {
             INDIRECT_BP_PULL_WGSL,
         );
 
+        // Milestone 12: Fused Indirect Sparse Queue Push
+        let prep_sparse_push_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("prep_sparse_push_bgl"),
+            entries: &[
+                Self::bgl_storage_rw(0), // state: IterationState
+                Self::bgl_storage_rw(1), // indirect_args: IndirectArgs
+                Self::bgl_storage_rw(2), // queue_sizes: array<atomic<u32>>
+            ],
+        });
+
+        let prep_sparse_push_pipeline = Self::create_compute_pipeline(
+            device,
+            "prep_sparse_push_pipeline",
+            &prep_sparse_push_layout,
+            PREP_SPARSE_PUSH_HOP_WGSL,
+        );
+
+        let indirect_sparse_push_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("indirect_sparse_push_bgl"),
+            entries: &[
+                Self::bgl_uniform(0),    // uniforms: PushUniforms
+                Self::bgl_uniform(1),    // state: IterationState
+                Self::bgl_storage_ro(2), // row_ptr
+                Self::bgl_storage_ro(3), // col_ind
+                Self::bgl_storage_rw(4), // queues
+                Self::bgl_storage_rw(5), // frontiers
+                Self::bgl_storage_rw(6), // visited
+                Self::bgl_storage_rw(7), // distance
+                Self::bgl_storage_rw(8), // enqueued
+                Self::bgl_storage_rw(9), // queue_sizes
+            ],
+        });
+
+        let indirect_sparse_push_pipeline = Self::create_compute_pipeline(
+            device,
+            "indirect_sparse_push_pipeline",
+            &indirect_sparse_push_layout,
+            INDIRECT_SPARSE_PUSH_WGSL,
+        );
+
+        // Milestone 12: Multi-Word Bit-Parallel Push
+        let multi_word_push_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("multi_word_push_bgl"),
+            entries: &[
+                Self::bgl_uniform(0),    // params: PushParams
+                Self::bgl_storage_ro(1), // row_ptr
+                Self::bgl_storage_ro(2), // col_ind
+                Self::bgl_storage_ro(3), // curr_frontier
+                Self::bgl_storage_rw(4), // next_candidate
+            ],
+        });
+
+        let multi_word_push_pipeline = Self::create_compute_pipeline(
+            device,
+            "multi_word_push_pipeline",
+            &multi_word_push_layout,
+            MULTI_WORD_BP_PUSH_WGSL,
+        );
+
+        let multi_word_filter_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("multi_word_filter_bgl"),
+            entries: &[
+                Self::bgl_uniform(0),    // params: FilterParams
+                Self::bgl_storage_rw(1), // next_candidate
+                Self::bgl_storage_rw(2), // visited
+                Self::bgl_storage_rw(3), // next_frontier
+                Self::bgl_storage_rw(4), // distance
+                Self::bgl_storage_rw(5), // active_count
+            ],
+        });
+
+        let multi_word_filter_pipeline = Self::create_compute_pipeline(
+            device,
+            "multi_word_filter_pipeline",
+            &multi_word_filter_layout,
+            MULTI_WORD_BP_FILTER_WGSL,
+        );
+
+        // Milestone 12: Fast GPU Buffer Reset & Source Initialization
+        let reset_dist_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("reset_dist_bgl"),
+            entries: &[
+                Self::bgl_uniform(0),    // params: ResetParams
+                Self::bgl_storage_rw(1), // data
+            ],
+        });
+
+        let reset_dist_pipeline = Self::create_compute_pipeline(
+            device,
+            "reset_dist_pipeline",
+            &reset_dist_layout,
+            RESET_BUFFER_U32_MAX_WGSL,
+        );
+
+        let init_sparse_sources_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("init_sparse_sources_bgl"),
+            entries: &[
+                Self::bgl_uniform(0),    // params: InitSourcesParams
+                Self::bgl_storage_ro(1), // sources
+                Self::bgl_storage_rw(2), // frontiers
+                Self::bgl_storage_rw(3), // visited
+                Self::bgl_storage_rw(4), // distance
+            ],
+        });
+
+        let init_sparse_sources_pipeline = Self::create_compute_pipeline(
+            device,
+            "init_sparse_sources_pipeline",
+            &init_sparse_sources_layout,
+            INIT_SPARSE_PUSH_SOURCES_WGSL,
+        );
+
+        // Milestone 14: Distance Quantization (u32 -> u16)
+        let pack_distances_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("pack_distances_bgl"),
+            entries: &[
+                Self::bgl_uniform(0),    // params: PackParams
+                Self::bgl_storage_ro(1), // dist_u32
+                Self::bgl_storage_rw(2), // dist_u16_packed
+            ],
+        });
+
+        let pack_distances_pipeline = Self::create_compute_pipeline(
+            device,
+            "pack_distances_pipeline",
+            &pack_distances_layout,
+            PACK_DISTANCES_U32_TO_U16_WGSL,
+        );
+
         Ok(Self {
             naive_layout,
             naive_pipeline,
@@ -328,6 +484,20 @@ impl PipelineCache {
             prep_hop_pipeline,
             indirect_bp_pull_layout,
             indirect_bp_pull_pipeline,
+            prep_sparse_push_layout,
+            prep_sparse_push_pipeline,
+            indirect_sparse_push_layout,
+            indirect_sparse_push_pipeline,
+            multi_word_push_layout,
+            multi_word_push_pipeline,
+            multi_word_filter_layout,
+            multi_word_filter_pipeline,
+            reset_dist_layout,
+            reset_dist_pipeline,
+            init_sparse_sources_layout,
+            init_sparse_sources_pipeline,
+            pack_distances_layout,
+            pack_distances_pipeline,
         })
     }
 
@@ -548,6 +718,75 @@ impl PipelineCache {
 
     pub fn indirect_bp_pull_pipeline(&self) -> &ComputePipeline {
         &self.indirect_bp_pull_pipeline
+    }
+
+    // Forwarding aliases specified in task description
+    pub fn pipeline_sparse_queue(&self) -> &ComputePipeline {
+        self.sparse_queue_pipeline()
+    }
+
+    pub fn pipeline_bit_parallel_64(&self) -> &ComputePipeline {
+        self.bp64_push_pipeline()
+    }
+
+    // Milestone 12: Fused Indirect Sparse Queue Push
+    pub fn prep_sparse_push_layout(&self) -> &BindGroupLayout {
+        &self.prep_sparse_push_layout
+    }
+
+    pub fn prep_sparse_push_pipeline(&self) -> &ComputePipeline {
+        &self.prep_sparse_push_pipeline
+    }
+
+    pub fn indirect_sparse_push_layout(&self) -> &BindGroupLayout {
+        &self.indirect_sparse_push_layout
+    }
+
+    pub fn indirect_sparse_push_pipeline(&self) -> &ComputePipeline {
+        &self.indirect_sparse_push_pipeline
+    }
+
+    // Milestone 12: Multi-Word Bit-Parallel Push
+    pub fn multi_word_push_layout(&self) -> &BindGroupLayout {
+        &self.multi_word_push_layout
+    }
+
+    pub fn multi_word_push_pipeline(&self) -> &ComputePipeline {
+        &self.multi_word_push_pipeline
+    }
+
+    pub fn multi_word_filter_layout(&self) -> &BindGroupLayout {
+        &self.multi_word_filter_layout
+    }
+
+    pub fn multi_word_filter_pipeline(&self) -> &ComputePipeline {
+        &self.multi_word_filter_pipeline
+    }
+
+    // Milestone 12: Fast GPU Buffer Reset & Source Initialization
+    pub fn reset_dist_layout(&self) -> &BindGroupLayout {
+        &self.reset_dist_layout
+    }
+
+    pub fn reset_dist_pipeline(&self) -> &ComputePipeline {
+        &self.reset_dist_pipeline
+    }
+
+    pub fn init_sparse_sources_layout(&self) -> &BindGroupLayout {
+        &self.init_sparse_sources_layout
+    }
+
+    pub fn init_sparse_sources_pipeline(&self) -> &ComputePipeline {
+        &self.init_sparse_sources_pipeline
+    }
+
+    // Milestone 14: Distance Quantization (u32 -> u16)
+    pub fn pack_distances_layout(&self) -> &BindGroupLayout {
+        &self.pack_distances_layout
+    }
+
+    pub fn pack_distances_pipeline(&self) -> &ComputePipeline {
+        &self.pack_distances_pipeline
     }
 }
 
