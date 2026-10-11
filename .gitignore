@@ -1,0 +1,20 @@
+# Rust build artifacts
+/target/
+rust_out
+**/*.rs.bk
+
+# SuiteSparse benchmark datasets & downloads
+/data/
+*.tar.gz
+*.mtx
+
+# Subagent teamwork logs and scratch spaces
+.agents/teamwork/
+
+# OS and Editor metadata
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*~

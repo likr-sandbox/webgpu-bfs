@@ -1,0 +1,31 @@
+[package]
+name = "webgpu-bfs-gpu"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "WebGPU runtime, GPU buffer manager, and MS-BFS compute pipelines"
+autotests = true
+
+[[test]]
+name = "e2e_tests"
+path = "../../tests/e2e_tests.rs"
+
+
+[dependencies]
+webgpu-bfs-core = { workspace = true }
+webgpu-bfs-shaders = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+bytemuck = { workspace = true }
+log = { workspace = true }
+futures-channel = { workspace = true }
+
+wgpu = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pollster = { workspace = true }
+
+[dev-dependencies]
+webgpu-bfs-cpu = { workspace = true }
+rand = { workspace = true }

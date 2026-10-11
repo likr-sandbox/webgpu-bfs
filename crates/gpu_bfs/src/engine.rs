@@ -1,0 +1,189 @@
+//! `GpuBfsEngine` implementation of `webgpu_bfs_core::BfsEngine`.
+
+use anyhow::{bail, Result};
+use std::sync::Arc;
+use webgpu_bfs_core::{BfsEngine, CsrGraph};
+
+use crate::{
+    context::GpuContext,
+    dispatch::{
+        batched_spmm::run_batched_spmm, bit_parallel_32::run_bit_parallel_32,
+        bit_parallel_64::run_bit_parallel_64, bit_parallel_64_pull::run_bit_parallel_64_pull,
+        boolean_reachability::run_boolean_reachability, indirect::run_indirect_macro_batch,
+        multi_word_bp::run_multi_word_bp, naive_seq::run_naive_sequential,
+        push_pull::run_push_pull_adaptive, push_pull::PushPullConfig,
+        sparse_bp::run_sparse_bp_64, sparse_queue::run_sparse_queue,
+    },
+    pipeline::PipelineCache,
+};
+
+/// Method selector for GPU BFS execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GpuBfsMethod {
+    #[default]
+    NaiveSequential,
+    BatchedDenseSpMM,
+    BitParallel32,
+    BitParallel64,
+    BitParallel64Pull,
+    BooleanReachability,
+    PushPullAdaptive,
+    SparseQueue,
+    SparseBitParallel64,
+    MultiWordBitParallel,
+    IndirectMacroBatch,
+}
+
+/// GPU Multi-Source BFS engine implementing `webgpu_bfs_core::BfsEngine`.
+pub struct GpuBfsEngine {
+    context: Arc<GpuContext>,
+    pipelines: Arc<PipelineCache>,
+    method: GpuBfsMethod,
+}
+
+impl GpuBfsEngine {
+    /// Creates a new `GpuBfsEngine` with the given context and method.
+    pub fn new(context: Arc<GpuContext>, method: GpuBfsMethod) -> Result<Self> {
+        let pipelines = Arc::new(PipelineCache::new(context.device())?);
+        Ok(Self {
+            context,
+            pipelines,
+            method,
+        })
+    }
+
+    /// Initializes a default GPU context and creates an engine with the specified method.
+    pub fn default_with_method(method: GpuBfsMethod) -> Result<Self> {
+        let context = Arc::new(GpuContext::init_blocking()?);
+        Self::new(context, method)
+    }
+
+    /// Creates an engine using the `NaiveSequential` method.
+    pub fn naive(context: Arc<GpuContext>) -> Result<Self> {
+        Self::new(context, GpuBfsMethod::NaiveSequential)
+    }
+
+    /// Creates an engine using the `BatchedDenseSpMM` method.
+    pub fn batched(context: Arc<GpuContext>) -> Result<Self> {
+        Self::new(context, GpuBfsMethod::BatchedDenseSpMM)
+    }
+
+    /// Creates an engine using the `BitParallel32` method.
+    pub fn bit_parallel_32(context: Arc<GpuContext>) -> Result<Self> {
+        Self::new(context, GpuBfsMethod::BitParallel32)
+    }
+
+    /// Creates an engine using the `BitParallel64` method.
+    pub fn bit_parallel_64(context: Arc<GpuContext>) -> Result<Self> {
+        Self::new(context, GpuBfsMethod::BitParallel64)
+    }
+
+    /// Creates an engine using the `BooleanReachability` method.
+    pub fn boolean_reachability(context: Arc<GpuContext>) -> Result<Self> {
+        Self::new(context, GpuBfsMethod::BooleanReachability)
+    }
+
+    /// Creates an engine using the `PushPullAdaptive` method.
+    pub fn push_pull_adaptive(context: Arc<GpuContext>) -> Result<Self> {
+        Self::new(context, GpuBfsMethod::PushPullAdaptive)
+    }
+
+    /// Creates an engine using the `SparseQueue` method.
+    pub fn sparse_queue(context: Arc<GpuContext>) -> Result<Self> {
+        Self::new(context, GpuBfsMethod::SparseQueue)
+    }
+
+    /// Creates an engine using the `SparseBitParallel64` method.
+    pub fn sparse_bit_parallel_64(context: Arc<GpuContext>) -> Result<Self> {
+        Self::new(context, GpuBfsMethod::SparseBitParallel64)
+    }
+
+    /// Creates an engine using the `MultiWordBitParallel` method.
+    pub fn multi_word_bit_parallel(context: Arc<GpuContext>) -> Result<Self> {
+        Self::new(context, GpuBfsMethod::MultiWordBitParallel)
+    }
+
+    /// Creates an engine using the `IndirectMacroBatch` method.
+    pub fn indirect_macro_batch(context: Arc<GpuContext>) -> Result<Self> {
+        Self::new(context, GpuBfsMethod::IndirectMacroBatch)
+    }
+
+    /// Returns the active execution method.
+    pub fn method(&self) -> GpuBfsMethod {
+        self.method
+    }
+
+    /// Returns a reference to the underlying `GpuContext`.
+    pub fn context(&self) -> &Arc<GpuContext> {
+        &self.context
+    }
+}
+
+impl BfsEngine for GpuBfsEngine {
+    fn run_ms_bfs(&self, graph: &CsrGraph, sources: &[u32]) -> Result<Vec<u32>> {
+        let num_vertices = graph.num_vertices;
+        let num_sources = sources.len();
+
+        if num_sources == 0 {
+            return Ok(Vec::new());
+        }
+
+        if num_vertices == 0 {
+            bail!(
+                "Source vertex {} at index 0 exceeds graph vertex count 0",
+                sources[0]
+            );
+        }
+
+        for (i, &s) in sources.iter().enumerate() {
+            if s as usize >= num_vertices {
+                bail!(
+                    "Source vertex {} at index {} exceeds graph vertex count {}",
+                    s,
+                    i,
+                    num_vertices
+                );
+            }
+        }
+
+        match self.method {
+            GpuBfsMethod::NaiveSequential => {
+                run_naive_sequential(&self.context, &self.pipelines, graph, sources)
+            }
+            GpuBfsMethod::BatchedDenseSpMM => {
+                run_batched_spmm(&self.context, &self.pipelines, graph, sources)
+            }
+            GpuBfsMethod::BitParallel32 => {
+                run_bit_parallel_32(&self.context, &self.pipelines, graph, sources)
+            }
+            GpuBfsMethod::BitParallel64 => {
+                run_bit_parallel_64(&self.context, &self.pipelines, graph, sources)
+            }
+            GpuBfsMethod::BitParallel64Pull => {
+                run_bit_parallel_64_pull(&self.context, &self.pipelines, graph, sources)
+            }
+            GpuBfsMethod::BooleanReachability => {
+                run_boolean_reachability(&self.context, &self.pipelines, graph, sources)
+            }
+            GpuBfsMethod::PushPullAdaptive => run_push_pull_adaptive(
+                &self.context,
+                &self.pipelines,
+                graph,
+                sources,
+                PushPullConfig::default(),
+            ),
+            GpuBfsMethod::SparseQueue => {
+                run_sparse_queue(&self.context, &self.pipelines, graph, sources)
+            }
+            GpuBfsMethod::SparseBitParallel64 => {
+                run_sparse_bp_64(&self.context, &self.pipelines, graph, sources)
+            }
+            GpuBfsMethod::MultiWordBitParallel => {
+                run_multi_word_bp(&self.context, &self.pipelines, graph, sources)
+            }
+            GpuBfsMethod::IndirectMacroBatch => {
+                run_indirect_macro_batch(&self.context, &self.pipelines, graph, sources)
+            }
+        }
+    }
+}

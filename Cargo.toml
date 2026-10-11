@@ -1,0 +1,68 @@
+[workspace]
+members = [
+    "crates/core",
+    "crates/cpu_bfs",
+    "crates/shaders",
+    "crates/gpu_bfs",
+    "crates/cli",
+    "crates/wasm",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["webgpu-bfs team"]
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/likr/webgpu-bfs"
+
+[workspace.dependencies]
+# Foundational / Core
+webgpu-bfs-core = { path = "crates/core" }
+webgpu-bfs-cpu = { path = "crates/cpu_bfs" }
+webgpu-bfs-shaders = { path = "crates/shaders" }
+webgpu-bfs-gpu = { path = "crates/gpu_bfs" }
+
+# Errors & Serialization
+thiserror = "2.0"
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Numerical & Utility
+bytemuck = { version = "1.21", features = ["derive"] }
+rand = "0.8"
+rand_chacha = "0.3"
+
+# Concurrency & CLI
+rayon = "1.10"
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4.5", features = ["derive", "cargo", "env"] }
+futures-channel = "0.3"
+
+# HTTP & Decompression (SuiteSparse Downloader)
+ureq = { version = "2.10", features = ["tls"] }
+flate2 = "1.0"
+tar = "0.4"
+
+# WASM bindings & browser APIs
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Navigator",
+    "Gpu",
+    "Performance",
+    "console",
+] }
+console_error_panic_hook = "0.1"
+console_log = "1.0"
+serde-wasm-bindgen = "0.6"
+
+# WebGPU Runtime & Shaders
+wgpu = { version = "24.0", features = ["wgsl"] }
+pollster = "0.4"
+naga = { version = "24.0", features = ["wgsl-in"] }

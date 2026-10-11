@@ -1,0 +1,13 @@
+[package]
+name = "webgpu-bfs-shaders"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Embedded WGSL compute shaders and validation for webgpu-bfs"
+
+[dependencies]
+# Zero runtime dependencies needed! Shaders are static string slices.
+
+[dev-dependencies]
+naga = { workspace = true }

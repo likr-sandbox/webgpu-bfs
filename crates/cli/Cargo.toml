@@ -1,0 +1,39 @@
+[package]
+name = "webgpu-bfs-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Native CLI benchmark runner, verification suite, and SuiteSparse dataset manager for WebGPU Multi-Source BFS"
+
+[[bin]]
+name = "webgpu-bfs"
+path = "src/main.rs"
+
+[dependencies]
+# Workspace crates
+webgpu-bfs-core = { workspace = true }
+webgpu-bfs-cpu = { workspace = true }
+webgpu-bfs-gpu = { workspace = true }
+
+# CLI Parsing (Clap v4)
+clap = { workspace = true }
+
+# Error Handling & Logging
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+
+# Serialization & Export Formats
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Utilities & PRNG
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+
+# HTTP Client & Decompression for Dataset Auto-Downloader
+ureq = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }

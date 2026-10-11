@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WebGPU Multi-Source BFS Engine & Benchmark Suite</title>
+  <meta name="description" content="High-performance GPU-parallel Multi-Source Breadth-First Search (MS-BFS) in WebGPU and WebAssembly.">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- Application Header -->
+  <header class="app-header">
+    <div class="header-brand">
+      <div class="brand-icon">
+        <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="5" cy="5" r="3" />
+          <circle cx="19" cy="5" r="3" />
+          <circle cx="12" cy="19" r="3" />
+          <circle cx="12" cy="10" r="2" />
+          <path d="M5 8v3a4 4 0 0 0 4 4h6a4 4 0 0 0 4-4V8" />
+          <path d="M12 12v4" />
+        </svg>
+      </div>
+      <div>
+        <h1 class="brand-title">WebGPU Multi-Source BFS</h1>
+        <p class="brand-subtitle">GraphBLAST-inspired Direction-Optimized GPU Graph Traversal</p>
+      </div>
+    </div>
+
+    <div class="header-status">
+      <div id="gpu-status-badge" class="status-badge status-checking">
+        <span class="status-dot"></span>
+        <span id="gpu-status-text">Detecting WebGPU...</span>
+      </div>
+      <div id="wasm-status-badge" class="status-badge status-checking">
+        <span class="status-dot"></span>
+        <span id="wasm-status-text">Loading WASM...</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- WebGPU Banner (Warning / Fallback Notice) -->
+  <div id="webgpu-banner" class="banner banner-hidden" role="alert">
+    <div class="banner-icon">
+      <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+        <line x1="12" y1="9" x2="12" y2="13" />
+        <line x1="12" y1="17" x2="12.01" y2="17" />
+      </svg>
+    </div>
+    <div class="banner-body">
+      <strong id="banner-title">WebGPU Unavailable</strong>
+      <p id="banner-message">
+        Your browser does not currently support WebGPU. GPU compute algorithms are disabled.
+        CPU Reference BFS remains fully operational. To enable WebGPU, use Chrome/Edge 113+ or Firefox Nightly with <code>dom.webgpu.enabled</code>.
+      </p>
+    </div>
+    <button id="banner-dismiss" class="btn-icon" aria-label="Dismiss banner">&times;</button>
+  </div>
+
+  <!-- Main Application Body -->
+  <main class="app-main">
+    <!-- Left Panel: Controls & Graph Setup -->
+    <aside class="sidebar-panel">
+      <!-- Section 1: Graph Configuration -->
+      <section class="card">
+        <div class="card-header">
+          <h2 class="card-title">1. Graph Configuration</h2>
+        </div>
+        <div class="card-body">
+          <div class="form-group">
+            <label for="graph-type-select">Graph Generator / Source</label>
+            <select id="graph-type-select" class="form-control">
+              <option value="grid2d" selected>Grid 2D (4-Connected Mesh)</option>
+              <option value="erdos_renyi">Erdős-Rényi G(n, p)</option>
+              <option value="random_tree">Connected Random Tree</option>
+              <option value="rmat">R-MAT Power-Law (Graph500)</option>
+              <option value="mtx_upload">Custom Matrix Market (.mtx)</option>
+            </select>
+          </div>
+
+          <!-- Dynamic Graph Parameter Groups -->
+          <div id="params-grid2d" class="param-group">
+            <div class="form-row">
+              <div class="form-group flex-1">
+                <label for="grid-width">Width (X)</label>
+                <input type="number" id="grid-width" class="form-control" value="20" min="2" max="500">
+              </div>
+              <div class="form-group flex-1">
+                <label for="grid-height">Height (Y)</label>
+                <input type="number" id="grid-height" class="form-control" value="20" min="2" max="500">
+              </div>
+            </div>
+          </div>
+
+          <div id="params-erdos_renyi" class="param-group param-group-hidden">
+            <div class="form-row">
+              <div class="form-group flex-1">
+                <label for="er-vertices">Vertices (|V|)</label>
+                <input type="number" id="er-vertices" class="form-control" value="100" min="4" max="10000">
+              </div>
+              <div class="form-group flex-1">
+                <label for="er-prob">Edge Prob (p)</label>
+                <input type="number" id="er-prob" class="form-control" value="0.05" min="0.001" max="1.0" step="0.01">
+              </div>
+            </div>
+            <div class="form-group">
+              <label for="er-seed">Seed (Optional)</label>
+              <input type="number" id="er-seed" class="form-control" placeholder="Random">
+            </div>
+          </div>
+
+          <div id="params-random_tree" class="param-group param-group-hidden">
+            <div class="form-row">
+              <div class="form-group flex-1">
+                <label for="tree-vertices">Vertices (|V|)</label>
+                <input type="number" id="tree-vertices" class="form-control" value="100" min="2" max="5000">
+              </div>
+              <div class="form-group flex-1">
+                <label for="tree-seed">Seed</label>
+                <input type="number" id="tree-seed" class="form-control" placeholder="Random">
+              </div>
+            </div>
+          </div>
+
+          <div id="params-rmat" class="param-group param-group-hidden">
+            <div class="form-row">
+              <div class="form-group flex-1">
+                <label for="rmat-scale">Scale (2^S)</label>
+                <input type="number" id="rmat-scale" class="form-control" value="7" min="3" max="14">
+              </div>
+              <div class="form-group flex-1">
+                <label for="rmat-edge-factor">Edge Factor</label>
+                <input type="number" id="rmat-edge-factor" class="form-control" value="8" min="1" max="32">
+              </div>
+            </div>
+            <div class="form-group">
+              <label for="rmat-seed">Seed</label>
+              <input type="number" id="rmat-seed" class="form-control" placeholder="Random">
+            </div>
+          </div>
+
+          <div id="params-mtx" class="param-group param-group-hidden">
+            <div class="drop-zone" id="mtx-dropzone">
+              <input type="file" id="mtx-file-input" accept=".mtx,.txt" class="drop-zone-input">
+              <div class="drop-zone-content">
+                <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                  <polyline points="17 8 12 3 7 8" />
+                  <line x1="12" y1="3" x2="12" y2="15" />
+                </svg>
+                <p>Drag & drop <code>.mtx</code> file or click to browse</p>
+                <span class="file-info-badge" id="mtx-file-name">e.g., luxembourg_osm.mtx</span>
+              </div>
+            </div>
+          </div>
+
+          <button id="btn-generate-graph" class="btn btn-secondary btn-block">
+            Generate / Load Graph
+          </button>
+
+          <!-- Graph Topology Metrics Display -->
+          <div class="graph-stats-card" id="graph-stats-card">
+            <div class="stat-mini">
+              <span class="stat-mini-label">Vertices (|V|)</span>
+              <span class="stat-mini-val" id="stat-vertex-count">400</span>
+            </div>
+            <div class="stat-mini">
+              <span class="stat-mini-label">Edges (|E|)</span>
+              <span class="stat-mini-val" id="stat-edge-count">1,520</span>
+            </div>
+            <div class="stat-mini">
+              <span class="stat-mini-label">Avg Degree</span>
+              <span class="stat-mini-val" id="stat-avg-degree">3.80</span>
+            </div>
+            <div class="stat-mini">
+              <span class="stat-mini-label">Topology</span>
+              <span class="stat-mini-val" id="stat-graph-type">Grid 2D</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Section 2: Algorithm & Multi-Source Configuration -->
+      <section class="card">
+        <div class="card-header">
+          <h2 class="card-title">2. BFS Traversal Parameters</h2>
+        </div>
+        <div class="card-body">
+          <div class="form-group">
+            <label for="algorithm-select">Execution Algorithm</label>
+            <select id="algorithm-select" class="form-control">
+              <optgroup label="GPU Compute (WebGPU)">
+                <option value="PushPullAdaptive" selected>Push/Pull Adaptive (GraphBLAST)</option>
+                <option value="BitParallel64">Bit-Parallel 64-source (Packed)</option>
+                <option value="BitParallel32">Bit-Parallel 32-source (Packed)</option>
+                <option value="BooleanReachability">Boolean Reachability (3-Stage)</option>
+                <option value="BatchedDenseSpMM">Batched Dense SpMM</option>
+                <option value="NaiveSequential">Naive Sequential Push</option>
+              </optgroup>
+              <optgroup label="Host Reference">
+                <option value="CpuReference">CPU Reference (FIFO Queue)</option>
+              </optgroup>
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label>Multi-Source Batch Selection</label>
+            <div class="source-mode-selector">
+              <button type="button" class="btn-toggle active" data-mode="single">Single Source</button>
+              <button type="button" class="btn-toggle" data-mode="batch32">32 Sources</button>
+              <button type="button" class="btn-toggle" data-mode="batch64">64 Sources</button>
+              <button type="button" class="btn-toggle" data-mode="custom">Custom</button>
+            </div>
+          </div>
+
+          <div class="form-group" id="source-input-group">
+            <label for="source-indices-input">Source Node IDs (comma-separated)</label>
+            <input type="text" id="source-indices-input" class="form-control" value="0" placeholder="e.g. 0, 5, 42">
+            <span class="input-hint" id="source-hint">Source count: 1</span>
+          </div>
+
+          <!-- Execution Action Buttons -->
+          <div class="action-buttons-group">
+            <button id="btn-run-bfs" class="btn btn-primary btn-block">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                <polygon points="5 3 19 12 5 21 5 3" />
+              </svg>
+              Run BFS Traversal
+            </button>
+            <button id="btn-run-benchmark" class="btn btn-accent btn-block">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="18" y1="20" x2="18" y2="10" />
+                <line x1="12" y1="20" x2="12" y2="4" />
+                <line x1="6" y1="20" x2="6" y2="14" />
+              </svg>
+              Run Benchmark Suite (All 7)
+            </button>
+          </div>
+        </div>
+      </section>
+    </aside>
+
+    <!-- Center Panel: Graph Visualization Canvas -->
+    <section class="canvas-panel">
+      <!-- Canvas Control Toolbar -->
+      <div class="canvas-toolbar">
+        <div class="toolbar-left">
+          <label for="viz-layout-select" class="toolbar-label">Layout:</label>
+          <select id="viz-layout-select" class="form-control form-control-sm">
+            <option value="auto" selected>Auto (Grid/Radial)</option>
+            <option value="grid2d">2D Mesh Coordinates</option>
+            <option value="radial_bfs">Concentric BFS Rings</option>
+            <option value="force">Force Directed (Spring)</option>
+          </select>
+
+          <label for="viz-source-select" class="toolbar-label ml-2">Display Source:</label>
+          <select id="viz-source-select" class="form-control form-control-sm">
+            <option value="0">Source 0 (Node #0)</option>
+          </select>
+        </div>
+
+        <div class="toolbar-center">
+          <button id="btn-anim-play" class="btn btn-icon" title="Play/Pause Wave Animation">
+            <svg id="icon-play" viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+              <polygon points="5 3 19 12 5 21 5 3" />
+            </svg>
+          </button>
+          <button id="btn-anim-step-prev" class="btn btn-icon" title="Step Previous">&laquo;</button>
+          <span id="anim-step-label" class="step-badge">Hop: 0 / 0</span>
+          <button id="btn-anim-step-next" class="btn btn-icon" title="Step Next">&raquo;</button>
+          <button id="btn-anim-reset" class="btn btn-icon" title="Reset Animation">&#8634;</button>
+          <label for="anim-speed-slider" class="toolbar-label ml-2">Speed:</label>
+          <input type="range" id="anim-speed-slider" min="20" max="600" value="150" class="slider-sm" title="Animation step delay">
+        </div>
+
+        <div class="toolbar-right">
+          <button id="btn-zoom-in" class="btn btn-icon" title="Zoom In">+</button>
+          <button id="btn-zoom-out" class="btn btn-icon" title="Zoom Out">&minus;</button>
+          <button id="btn-zoom-fit" class="btn btn-icon" title="Fit to View">Fit</button>
+        </div>
+      </div>
+
+      <!-- Graph Canvas Container -->
+      <div class="canvas-wrapper" id="canvas-wrapper">
+        <canvas id="graph-canvas"></canvas>
+        <div id="node-tooltip" class="node-tooltip hidden"></div>
+      </div>
+
+      <!-- Canvas Color Legend -->
+      <footer class="canvas-legend">
+        <div class="legend-item"><span class="legend-color color-source"></span> Source (Hop 0)</div>
+        <div class="legend-item"><span class="legend-color color-frontier"></span> Active Frontier</div>
+        <div class="legend-item"><span class="legend-color color-visited"></span> Visited (Hop 1..K)</div>
+        <div class="legend-item"><span class="legend-color color-unreached"></span> Unreached</div>
+        <div class="legend-spacer"></div>
+        <div class="legend-counter" id="legend-frontier-stat">Frontier: 0 nodes</div>
+      </footer>
+    </section>
+
+    <!-- Right Panel: Results, Metrics & Benchmark Comparisons -->
+    <aside class="dashboard-panel">
+      <!-- KPI Metric Cards -->
+      <section class="kpi-grid">
+        <div class="kpi-card">
+          <span class="kpi-label">Execution Time</span>
+          <span class="kpi-value text-accent" id="metric-time">--</span>
+          <span class="kpi-sub" id="metric-time-sub">GPU kernel + staging</span>
+        </div>
+        <div class="kpi-card">
+          <span class="kpi-label">Throughput (MTEPS)</span>
+          <span class="kpi-value text-success" id="metric-mteps">--</span>
+          <span class="kpi-sub" id="metric-mteps-sub">Million Edges / sec</span>
+        </div>
+        <div class="kpi-card">
+          <span class="kpi-label">Traversed Edges</span>
+          <span class="kpi-value" id="metric-edges">--</span>
+          <span class="kpi-sub" id="metric-edges-sub">In reached graph</span>
+        </div>
+        <div class="kpi-card">
+          <span class="kpi-label">Visited Vertices</span>
+          <span class="kpi-value" id="metric-vertices">--</span>
+          <span class="kpi-sub" id="metric-vertices-sub">Coverage %</span>
+        </div>
+      </section>
+
+      <!-- Tab Navigation: Benchmark Chart vs Log Window -->
+      <div class="tab-header">
+        <button class="tab-btn active" data-tab="tab-benchmark">Benchmark Suite</button>
+        <button class="tab-btn" data-tab="tab-table">Comparative Table</button>
+        <button class="tab-btn" data-tab="tab-logs">Execution Logs</button>
+      </div>
+
+      <!-- Tab 1: Benchmark Chart View -->
+      <div class="tab-pane active" id="tab-benchmark">
+        <div class="benchmark-chart-header">
+          <h3 class="panel-subtitle">Comparative MTEPS & Runtime</h3>
+          <span class="badge-subtle" id="bench-status-badge">Ready</span>
+        </div>
+        <div class="chart-container">
+          <canvas id="benchmark-chart"></canvas>
+        </div>
+      </div>
+
+      <!-- Tab 2: Comparative Table View -->
+      <div class="tab-pane" id="tab-table">
+        <div class="table-responsive">
+          <table class="benchmark-table" id="benchmark-table">
+            <thead>
+              <tr>
+                <th>Algorithm</th>
+                <th>Time (ms)</th>
+                <th>MTEPS</th>
+                <th>Speedup</th>
+                <th>Correctness</th>
+              </tr>
+            </thead>
+            <tbody id="benchmark-table-body">
+              <tr>
+                <td colspan="5" class="table-empty">Run "Run Benchmark Suite" to generate comparative results.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="table-actions">
+          <button id="btn-export-csv" class="btn btn-secondary btn-sm" disabled>Export CSV</button>
+          <button id="btn-export-json" class="btn btn-secondary btn-sm" disabled>Export JSON</button>
+        </div>
+      </div>
+
+      <!-- Tab 3: Execution Log Window -->
+      <div class="tab-pane" id="tab-logs">
+        <div class="log-actions">
+          <label class="checkbox-label">
+            <input type="checkbox" id="log-autoscroll" checked> Auto-scroll
+          </label>
+          <button id="btn-clear-logs" class="btn btn-secondary btn-sm">Clear</button>
+          <button id="btn-copy-logs" class="btn btn-secondary btn-sm">Copy</button>
+        </div>
+        <div class="log-window" id="log-window">
+          <div class="log-line log-info"><span class="log-ts">[00:00:00]</span> WebGPU BFS Engine Dashboard initialized.</div>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <!-- Modular Scripts -->
+  <script type="module" src="app.js"></script>
+</body>
+</html>

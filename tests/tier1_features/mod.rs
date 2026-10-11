@@ -1,0 +1,12 @@
+pub mod t1_01_graph_core;
+pub mod t1_02_transposition;
+pub mod t1_03_mtx_reader;
+pub mod t1_04_grid2d;
+pub mod t1_05_erdos_renyi;
+pub mod t1_06_random_tree;
+pub mod t1_07_rmat;
+pub mod t1_08_cpu_bfs;
+pub mod t1_09_gpu_naive_spmm;
+pub mod t1_10_gpu_bitparallel;
+pub mod t1_11_gpu_boolean;
+pub mod t1_12_gpu_pushpull;
