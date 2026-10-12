@@ -25,6 +25,7 @@ pub enum Commands {
     Run(RunArgs),
 
     /// Benchmark multi-source BFS across warm-up and timed iterations
+    #[command(visible_alias = "benchmark")]
     Bench(BenchCommandArgs),
 
     /// Verify 100% bitwise distance equivalence against CPU reference ground truth
@@ -256,6 +257,10 @@ pub struct GraphInputArgs {
     pub seed: Option<u64>,
 }
 
+/// Standard multi-source batch sizes across all benchmark evaluations.
+#[allow(dead_code)]
+pub const STANDARD_BATCH_SIZES: &[usize] = &[1, 16, 64, 256, 1024, 2048];
+
 #[derive(Args, Debug, Clone, Default)]
 pub struct SourceArgs {
     /// Explicit comma-separated list of source vertex IDs (e.g., "0,10,42,100")
@@ -267,8 +272,14 @@ pub struct SourceArgs {
     )]
     pub sources: Option<Vec<u32>>,
 
-    /// Number of source vertices to sample randomly (batch size) [default: 1]
-    #[arg(long, short = 's', value_name = "N", conflicts_with = "sources", alias = "batch-size")]
+    /// Number of source vertices to sample randomly (batch size S, standard: 1, 16, 64, 256, 1024, 2048) [default: 1]
+    #[arg(
+        long,
+        short = 's',
+        value_name = "N",
+        conflicts_with = "sources",
+        alias = "batch-size"
+    )]
     pub num_sources: Option<usize>,
 
     /// Source vertex selection strategy
@@ -420,6 +431,14 @@ pub enum MethodArg {
 
     #[value(name = "All", alias = "all")]
     All,
+
+    #[value(
+        name = "Auto",
+        alias = "auto",
+        alias = "heuristic",
+        alias = "topology-aware"
+    )]
+    Auto,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize)]
@@ -545,5 +564,140 @@ mod tests {
         ];
         let cli = Cli::try_parse_from(args).unwrap();
         assert_eq!(cli.run_args.method, MethodArg::IndirectMacroBatch);
+    }
+
+    #[test]
+    fn test_parse_benchmark_alias_subcommand() {
+        let args = vec![
+            "webgpu-bfs",
+            "benchmark",
+            "--grid",
+            "20x20",
+            "-s",
+            "16",
+            "--method",
+            "all",
+        ];
+        let cli = Cli::try_parse_from(args).expect("Failed to parse benchmark alias");
+        match cli.command {
+            Some(Commands::Bench(bench_args)) => {
+                assert_eq!(bench_args.graph.grid.as_deref(), Some("20x20"));
+                assert_eq!(bench_args.sources.num_sources, Some(16));
+                assert_eq!(bench_args.method, MethodArg::All);
+            }
+            other => panic!("Expected Commands::Bench from 'benchmark' alias, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_explicit_sources_list() {
+        let args = vec![
+            "webgpu-bfs",
+            "verify",
+            "--grid",
+            "10x10",
+            "--sources",
+            "0,5,42,99",
+        ];
+        let cli = Cli::try_parse_from(args).expect("Failed to parse explicit sources list");
+        match cli.command {
+            Some(Commands::Verify(verify_args)) => {
+                assert_eq!(verify_args.sources.sources, Some(vec![0, 5, 42, 99]));
+                assert_eq!(verify_args.sources.num_sources, None);
+            }
+            other => panic!("Expected Commands::Verify, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_sources_and_num_sources_mutual_exclusion() {
+        let args = vec![
+            "webgpu-bfs",
+            "bench",
+            "--grid",
+            "10x10",
+            "--sources",
+            "0,5,10",
+            "-s",
+            "16",
+        ];
+        let result = Cli::try_parse_from(args);
+        assert!(
+            result.is_err(),
+            "Expected mutual exclusion error between --sources and -s"
+        );
+    }
+
+    #[test]
+    fn test_batch_size_alias_for_num_sources() {
+        let args = vec![
+            "webgpu-bfs",
+            "benchmark",
+            "--grid",
+            "10x10",
+            "--batch-size",
+            "64",
+        ];
+        let cli = Cli::try_parse_from(args).expect("Failed to parse batch-size alias");
+        match cli.command {
+            Some(Commands::Bench(bench_args)) => {
+                assert_eq!(bench_args.sources.num_sources, Some(64));
+            }
+            other => panic!("Expected Commands::Bench, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_bench_and_benchmark_parity() {
+        let args_bench = vec!["webgpu-bfs", "bench", "--grid", "10x10", "-s", "8"];
+        let args_benchmark = vec!["webgpu-bfs", "benchmark", "--grid", "10x10", "-s", "8"];
+
+        let cli1 = Cli::try_parse_from(args_bench).unwrap();
+        let cli2 = Cli::try_parse_from(args_benchmark).unwrap();
+
+        match (cli1.command, cli2.command) {
+            (Some(Commands::Bench(b1)), Some(Commands::Bench(b2))) => {
+                assert_eq!(b1.graph.grid, b2.graph.grid);
+                assert_eq!(b1.sources.num_sources, b2.sources.num_sources);
+                assert_eq!(b1.warmup, b2.warmup);
+                assert_eq!(b1.iters, b2.iters);
+            }
+            _ => panic!("Both should parse into Commands::Bench"),
+        }
+    }
+
+    #[test]
+    fn test_parse_verify_web_stanford_undirected_flags() {
+        let args = vec![
+            "webgpu-bfs",
+            "verify",
+            "--dataset",
+            "web-Stanford-undirected",
+            "-s",
+            "64",
+            "-m",
+            "BitParallel32",
+        ];
+        let cli = Cli::try_parse_from(args).expect("Failed to parse verify args");
+        match cli.command {
+            Some(Commands::Verify(v_args)) => {
+                assert_eq!(
+                    v_args.graph.dataset.as_deref(),
+                    Some("web-Stanford-undirected")
+                );
+                assert_eq!(v_args.sources.num_sources, Some(64));
+                assert_eq!(v_args.method, MethodArg::BitParallel32);
+            }
+            other => panic!("Expected Commands::Verify, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_auto_method_and_aliases() {
+        for alias in &["Auto", "auto", "heuristic", "topology-aware"] {
+            let args = vec!["webgpu-bfs", "--grid", "10x10", "-m", alias];
+            let cli = Cli::try_parse_from(args).unwrap_or_else(|_| panic!("Failed to parse {}", alias));
+            assert_eq!(cli.run_args.method, MethodArg::Auto);
+        }
     }
 }

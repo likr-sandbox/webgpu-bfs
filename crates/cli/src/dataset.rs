@@ -11,6 +11,7 @@ use crate::args::DownloadDatasetArgs;
 #[derive(Debug, Clone)]
 pub struct DatasetMetadata {
     pub name: &'static str,
+    pub filename: &'static str,
     pub group: &'static str,
     pub vertices: usize,
     pub edges: usize,
@@ -21,6 +22,7 @@ pub struct DatasetMetadata {
 pub const KNOWN_DATASETS: &[DatasetMetadata] = &[
     DatasetMetadata {
         name: "luxembourg_osm",
+        filename: "luxembourg_osm.mtx",
         group: "DIMACS10",
         vertices: 114_599,
         edges: 239_332,
@@ -29,6 +31,7 @@ pub const KNOWN_DATASETS: &[DatasetMetadata] = &[
     },
     DatasetMetadata {
         name: "ca-GrQc",
+        filename: "ca-GrQc.mtx",
         group: "SNAP",
         vertices: 5_242,
         edges: 28_980,
@@ -37,6 +40,7 @@ pub const KNOWN_DATASETS: &[DatasetMetadata] = &[
     },
     DatasetMetadata {
         name: "delaunay_n16",
+        filename: "delaunay_n16.mtx",
         group: "DIMACS10",
         vertices: 65_536,
         edges: 393_150,
@@ -45,6 +49,7 @@ pub const KNOWN_DATASETS: &[DatasetMetadata] = &[
     },
     DatasetMetadata {
         name: "minnesota",
+        filename: "minnesota.mtx",
         group: "Gleich",
         vertices: 2_642,
         edges: 6_606,
@@ -53,45 +58,185 @@ pub const KNOWN_DATASETS: &[DatasetMetadata] = &[
     },
     DatasetMetadata {
         name: "web-Stanford",
+        filename: "web-Stanford-undirected.mtx",
         group: "SNAP",
         vertices: 281_903,
-        edges: 2_312_497,
-        description: "Stanford web page graph from 2002 (SNAP)",
+        edges: 3_985_272,
+        description: "Stanford web page graph from 2002 (SNAP, undirected)",
         url: "https://sparse.tamu.edu/MM/SNAP/web-Stanford.tar.gz",
     },
 ];
 
 pub fn find_in_catalog(name: &str) -> Option<&'static DatasetMetadata> {
-    KNOWN_DATASETS
-        .iter()
-        .find(|d| d.name.eq_ignore_ascii_case(name))
+    KNOWN_DATASETS.iter().find(|d| {
+        d.name.eq_ignore_ascii_case(name)
+            || d.name.replace('_', "-").eq_ignore_ascii_case(&name.replace('_', "-"))
+            || (d.name.eq_ignore_ascii_case("web-Stanford")
+                && (name.eq_ignore_ascii_case("web-Stanford-undirected")
+                    || name.replace('_', "-").eq_ignore_ascii_case("web-Stanford-undirected")))
+    })
 }
 
 pub fn list_datasets() {
     println!("\nAvailable SuiteSparse Benchmark Datasets in Local Catalog:\n");
     println!(
-        " {:<16} {:<10} {:>10} {:>10}  Description",
+        " {:<24} {:<10} {:>10} {:>10}  Description",
         "Dataset", "Group", "|V|", "|E| (approx)"
     );
-    println!("--------------------------------------------------------------------------------");
+    println!("----------------------------------------------------------------------------------------");
     for meta in KNOWN_DATASETS {
         println!(
-            " {:<16} {:<10} {:>10} {:>10}  {}",
+            " {:<24} {:<10} {:>10} {:>10}  {}",
             meta.name, meta.group, meta.vertices, meta.edges, meta.description
         );
     }
-    println!("--------------------------------------------------------------------------------");
+    println!("----------------------------------------------------------------------------------------");
     println!("Download any dataset using: webgpu-bfs download-dataset --name <NAME>\n");
 }
 
-pub fn ensure_dataset_downloaded(name: &str, target_dir: &Path, force: bool) -> Result<PathBuf> {
-    let mtx_path = target_dir.join(name).join(format!("{}.mtx", name));
-    if mtx_path.exists() && !force {
-        if validate_mtx_file(&mtx_path).is_ok() {
-            log::info!("Dataset '{}' already exists at {:?}", name, mtx_path);
-            return Ok(mtx_path);
+fn candidate_target_dirs(target_dir: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![target_dir.to_path_buf()];
+    if !target_dir.is_absolute() {
+        // If running inside a workspace crate (e.g. crates/cli), check workspace root
+        if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
+            let manifest_path = PathBuf::from(manifest);
+            if let Some(parent) = manifest_path.parent() {
+                if let Some(workspace_root) = parent.parent() {
+                    let ws_dir = workspace_root.join(target_dir);
+                    if !dirs.contains(&ws_dir) {
+                        dirs.push(ws_dir);
+                    }
+                }
+            }
         }
-        log::warn!("Existing file {:?} is invalid; re-downloading...", mtx_path);
+        // Also walk up parent directories from current working directory
+        if let Ok(cwd) = std::env::current_dir() {
+            let mut curr = cwd.as_path();
+            while let Some(parent) = curr.parent() {
+                let candidate = parent.join(target_dir);
+                if candidate.exists() && !dirs.contains(&candidate) {
+                    dirs.push(candidate);
+                }
+                curr = parent;
+            }
+        }
+    }
+    dirs
+}
+
+pub fn resolve_existing_dataset_path(name: &str, target_dir: &Path) -> Option<PathBuf> {
+    let dirs = candidate_target_dirs(target_dir);
+    for dir in &dirs {
+        // 1. web-Stanford is ALWAYS treated as undirected
+        let is_stanford = name.eq_ignore_ascii_case("web-Stanford")
+            || name.replace('_', "-").eq_ignore_ascii_case("web-Stanford")
+            || name.eq_ignore_ascii_case("web-Stanford-undirected")
+            || name.replace('_', "-").eq_ignore_ascii_case("web-Stanford-undirected");
+        if is_stanford {
+            let candidate_paths = [
+                dir.join("web-Stanford").join("web-Stanford-undirected.mtx"),
+                dir.join("web-Stanford-undirected").join("web-Stanford-undirected.mtx"),
+            ];
+            for path in candidate_paths {
+                if path.exists() && validate_mtx_file(&path).is_ok() {
+                    return Some(path);
+                }
+            }
+        }
+
+        // 2. Direct standard path: dir/<name>/<name>.mtx
+        let standard = dir.join(name).join(format!("{}.mtx", name));
+        if standard.exists() && validate_mtx_file(&standard).is_ok() {
+            return Some(standard);
+        }
+
+        // 3. Canonical catalog name and custom filename (if defined)
+        if let Some(meta) = find_in_catalog(name) {
+            let meta_path = dir.join(meta.name).join(meta.filename);
+            if meta_path.exists() && validate_mtx_file(&meta_path).is_ok() {
+                return Some(meta_path);
+            }
+            let meta_named_mtx = dir.join(meta.name).join(format!("{}.mtx", meta.name));
+            if meta_named_mtx.exists() && validate_mtx_file(&meta_named_mtx).is_ok() {
+                return Some(meta_named_mtx);
+            }
+        }
+    }
+
+    None
+}
+
+pub fn generate_undirected_mtx_from_directed(
+    directed_path: &Path,
+    undirected_path: &Path,
+) -> Result<()> {
+    let input_file = File::open(directed_path)
+        .with_context(|| format!("Cannot open directed MTX file {:?}", directed_path))?;
+    let mut reader = BufReader::new(input_file);
+
+    let mut first_line = String::new();
+    reader
+        .read_line(&mut first_line)
+        .context("Failed to read header line from directed MTX")?;
+
+    let symmetric_header = if first_line.to_ascii_lowercase().contains("general") {
+        first_line.replacen("general", "symmetric", 1)
+    } else if !first_line.to_ascii_lowercase().contains("symmetric") {
+        let trimmed = first_line.trim_end();
+        format!("{} symmetric\n", trimmed)
+    } else {
+        first_line
+    };
+
+    if let Some(parent) = undirected_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create directory {:?}", parent))?;
+    }
+
+    let output_file = File::create(undirected_path)
+        .with_context(|| format!("Failed to create undirected MTX file {:?}", undirected_path))?;
+    let mut writer = std::io::BufWriter::new(output_file);
+    use std::io::Write;
+    writer.write_all(symmetric_header.as_bytes())?;
+    std::io::copy(&mut reader, &mut writer)?;
+    writer.flush()?;
+
+    Ok(())
+}
+
+pub fn ensure_dataset(name: &str, target_dir: &Path, force: bool) -> Result<PathBuf> {
+    ensure_dataset_downloaded(name, target_dir, force)
+}
+
+pub fn ensure_dataset_downloaded(name: &str, target_dir: &Path, force: bool) -> Result<PathBuf> {
+    if !force {
+        if let Some(path) = resolve_existing_dataset_path(name, target_dir) {
+            log::info!("Dataset '{}' already exists at {:?}", name, path);
+            return Ok(path);
+        }
+    }
+
+    let is_stanford = name.eq_ignore_ascii_case("web-Stanford")
+        || name.replace('_', "-").eq_ignore_ascii_case("web-Stanford")
+        || name.eq_ignore_ascii_case("web-Stanford-undirected")
+        || name.replace('_', "-").eq_ignore_ascii_case("web-Stanford-undirected");
+
+    if is_stanford {
+        let dataset_dir = target_dir.join("web-Stanford");
+        let undirected_path = dataset_dir.join("web-Stanford-undirected.mtx");
+        if undirected_path.exists() && !force {
+            if let Ok(_) = validate_mtx_file(&undirected_path) {
+                return Ok(undirected_path);
+            }
+        }
+        let args = DownloadDatasetArgs {
+            name: "web-Stanford".to_string(),
+            group: Some("SNAP".to_string()),
+            url: Some("https://sparse.tamu.edu/MM/SNAP/web-Stanford.tar.gz".to_string()),
+            dir: target_dir.to_path_buf(),
+            force,
+        };
+        return run_download_dataset(&args);
     }
 
     let args = DownloadDatasetArgs {
@@ -106,6 +251,47 @@ pub fn ensure_dataset_downloaded(name: &str, target_dir: &Path, force: bool) -> 
 
 pub fn run_download_dataset(args: &DownloadDatasetArgs) -> Result<PathBuf> {
     let name = &args.name;
+
+    let is_stanford = name.eq_ignore_ascii_case("web-Stanford")
+        || name.replace('_', "-").eq_ignore_ascii_case("web-Stanford")
+        || name.eq_ignore_ascii_case("web-Stanford-undirected")
+        || name.replace('_', "-").eq_ignore_ascii_case("web-Stanford-undirected");
+
+    if is_stanford {
+        let dataset_dir = args.dir.join("web-Stanford");
+        let undirected_path = dataset_dir.join("web-Stanford-undirected.mtx");
+        if undirected_path.exists() && !args.force {
+            if let Ok((v, e)) = validate_mtx_file(&undirected_path) {
+                println!(
+                    "Dataset 'web-Stanford' (undirected) ready (|V|={}, |E|={}) at: {}",
+                    v, e, undirected_path.display()
+                );
+                return Ok(undirected_path);
+            }
+        }
+        let raw_args = DownloadDatasetArgs {
+            name: "web-Stanford-raw".to_string(),
+            group: Some("SNAP".to_string()),
+            url: Some("https://sparse.tamu.edu/MM/SNAP/web-Stanford.tar.gz".to_string()),
+            dir: args.dir.clone(),
+            force: args.force,
+        };
+        let raw_mtx = run_download_dataset(&raw_args)?;
+        println!(
+            "Generating undirected symmetrized graph {:?} from {:?}...",
+            undirected_path, raw_mtx
+        );
+        generate_undirected_mtx_from_directed(&raw_mtx, &undirected_path)?;
+        let (v, e) = validate_mtx_file(&undirected_path)?;
+        println!(
+            "Successfully prepared 'web-Stanford' (undirected): |V| = {}, |E| = {}\nLocation: {}",
+            v,
+            e,
+            undirected_path.display()
+        );
+        return Ok(undirected_path);
+    }
+
     let url = if let Some(ref u) = args.url {
         u.clone()
     } else if let Some(meta) = find_in_catalog(name) {
@@ -124,7 +310,10 @@ pub fn run_download_dataset(args: &DownloadDatasetArgs) -> Result<PathBuf> {
     fs::create_dir_all(&dataset_dir)
         .with_context(|| format!("Failed to create dataset directory {:?}", dataset_dir))?;
 
-    let target_mtx = dataset_dir.join(format!("{}.mtx", name));
+    let target_filename = find_in_catalog(name)
+        .map(|m| m.filename)
+        .unwrap_or(format!("{}.mtx", name).leak());
+    let target_mtx = dataset_dir.join(target_filename);
 
     if target_mtx.exists() && !args.force {
         if let Ok((v, e)) = validate_mtx_file(&target_mtx) {
@@ -431,5 +620,92 @@ mod tests {
         assert!(result.is_err());
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_catalog_finds_web_stanford() {
+        let meta = find_in_catalog("web-Stanford")
+            .expect("Should find web-Stanford");
+        assert_eq!(meta.group, "SNAP");
+        assert_eq!(meta.vertices, 281_903);
+        assert_eq!(meta.edges, 3_985_272);
+        assert_eq!(meta.filename, "web-Stanford-undirected.mtx");
+
+        let meta2 = find_in_catalog("web-Stanford-undirected")
+            .expect("Should find web-Stanford-undirected alias");
+        assert_eq!(meta2.filename, "web-Stanford-undirected.mtx");
+    }
+
+    #[test]
+    fn test_catalog_case_insensitive_web_stanford() {
+        assert!(find_in_catalog("WEB-STANFORD").is_some());
+        assert!(find_in_catalog("web_stanford").is_some());
+        assert!(find_in_catalog("WEB-STANFORD-UNDIRECTED").is_some());
+        assert!(find_in_catalog("web_stanford_undirected").is_some());
+        assert!(find_in_catalog("Web-Stanford-Undirected").is_some());
+    }
+
+    #[test]
+    fn test_resolve_existing_dataset_web_stanford() {
+        let resolved = resolve_existing_dataset_path("web-Stanford", Path::new("data"));
+        assert!(
+            resolved.is_some(),
+            "Should resolve data/web-Stanford/web-Stanford-undirected.mtx"
+        );
+        let path = resolved.unwrap();
+        assert!(path.exists());
+        assert!(path.ends_with("web-Stanford-undirected.mtx"));
+
+        let resolved_undir = resolve_existing_dataset_path("web-Stanford-undirected", Path::new("data"));
+        assert!(resolved_undir.is_some());
+        assert!(resolved_undir.unwrap().ends_with("web-Stanford-undirected.mtx"));
+    }
+
+    #[test]
+    fn test_ensure_dataset_web_stanford() {
+        let res = ensure_dataset("web-Stanford", Path::new("data"), false);
+        assert!(
+            res.is_ok(),
+            "ensure_dataset must succeed: {:?}",
+            res.err()
+        );
+        let path = res.unwrap();
+        assert!(path.exists());
+        assert!(path.ends_with("web-Stanford-undirected.mtx"));
+    }
+
+    #[test]
+    fn test_generate_undirected_mtx_from_directed() {
+        let temp_dir = std::env::temp_dir().join("test_generate_undirected_mtx");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let directed = temp_dir.join("directed.mtx");
+        let undirected = temp_dir.join("undirected.mtx");
+
+        fs::write(
+            &directed,
+            "%%MatrixMarket matrix coordinate pattern general\n% comment\n3 3 2\n1 2\n2 3\n",
+        )
+        .unwrap();
+
+        generate_undirected_mtx_from_directed(&directed, &undirected).unwrap();
+
+        let content = fs::read_to_string(&undirected).unwrap();
+        assert!(content.starts_with("%%MatrixMarket matrix coordinate pattern symmetric"));
+        assert!(content.contains("3 3 2"));
+        assert!(content.contains("1 2"));
+        assert!(content.contains("2 3"));
+
+        let (v, e) = validate_mtx_file(&undirected).unwrap();
+        assert_eq!(v, 3);
+        assert_eq!(e, 4); // symmetric counted as nnz * 2 in validate_mtx_file
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_list_datasets_runs_without_panic() {
+        list_datasets();
     }
 }

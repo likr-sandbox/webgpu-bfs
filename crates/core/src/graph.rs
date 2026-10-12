@@ -131,6 +131,24 @@ impl CsrGraph {
         self.row_offsets == csc.col_offsets && self.col_indices == csc.row_indices
     }
 
+    /// Converts the graph to an undirected (symmetric) graph by adding reverse edges for all directed edges.
+    /// If the graph is already symmetric, returns a clone.
+    pub fn to_undirected(&self) -> Self {
+        if self.is_symmetric() {
+            return self.clone();
+        }
+        let mut edges = Vec::with_capacity(self.num_edges * 2);
+        for u in 0..self.num_vertices {
+            let start = self.row_offsets[u] as usize;
+            let end = self.row_offsets[u + 1] as usize;
+            for &v in &self.col_indices[start..end] {
+                edges.push((u as u32, v));
+                edges.push((v, u as u32));
+            }
+        }
+        Self::from_edge_list(self.num_vertices, &edges)
+    }
+
     /// Returns the number of vertices |V| in the graph.
     #[inline(always)]
     pub fn num_vertices(&self) -> usize {
@@ -495,6 +513,21 @@ mod tests {
         let sym_edges = vec![(0, 1), (1, 0), (1, 2), (2, 1)];
         let sym_graph = CsrGraph::from_edge_list(3, &sym_edges);
         assert!(sym_graph.is_symmetric());
+    }
+
+    #[test]
+    fn test_to_undirected() {
+        let dir_edges = vec![(0, 1), (1, 2)];
+        let dir_graph = CsrGraph::from_edge_list(3, &dir_edges);
+        assert!(!dir_graph.is_symmetric());
+
+        let undir_graph = dir_graph.to_undirected();
+        assert!(undir_graph.is_symmetric());
+        assert_eq!(undir_graph.num_vertices(), 3);
+        assert_eq!(undir_graph.num_edges(), 4);
+        assert_eq!(undir_graph.neighbors(0), &[1]);
+        assert_eq!(undir_graph.neighbors(1), &[0, 2]);
+        assert_eq!(undir_graph.neighbors(2), &[1]);
     }
 
     #[test]

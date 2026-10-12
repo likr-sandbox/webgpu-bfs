@@ -40,6 +40,8 @@ pub enum GpuBfsMethod {
     IndirectSparseQueuePush,
     /// Milestone M12: Multi-Word Bit-Parallel Push for massive batches (S >= 128..2048).
     MultiWordBitParallelPush,
+    /// Milestone M17: Topology-aware automatic method selection.
+    Auto,
 }
 
 /// GPU Multi-Source BFS engine implementing `webgpu_bfs_core::BfsEngine`.
@@ -128,6 +130,61 @@ impl GpuBfsEngine {
         Self::new(context, GpuBfsMethod::MultiWordBitParallelPush)
     }
 
+    /// Creates an engine with topology-aware automatic method selection (Milestone M17).
+    pub fn auto(context: Arc<GpuContext>) -> Result<Self> {
+        Self::new(context, GpuBfsMethod::Auto)
+    }
+
+    /// Selects the optimal BFS method based on graph degree distribution and batch size.
+    pub fn select_auto_method(graph: &CsrGraph, num_sources: usize) -> GpuBfsMethod {
+        if graph.is_empty() || num_sources == 0 {
+            return GpuBfsMethod::NaiveSequential;
+        }
+
+        let max_degree = graph.max_degree();
+
+        if max_degree <= 32 {
+            // Branch 1: Degree-uniform road networks, planar meshes, and regular trees
+            if num_sources >= 64 {
+                GpuBfsMethod::MultiWordBitParallel
+            } else if num_sources >= 32 {
+                GpuBfsMethod::BitParallel64
+            } else if num_sources > 1 {
+                GpuBfsMethod::BitParallel32
+            } else {
+                GpuBfsMethod::SparseQueue
+            }
+        } else if max_degree >= 128 {
+            // Branch 2: Scale-free power-law graphs with massive hubs
+            if num_sources >= 64 {
+                GpuBfsMethod::IndirectSparseQueuePush
+            } else if num_sources > 1 {
+                GpuBfsMethod::BitParallel64
+            } else {
+                GpuBfsMethod::SparseQueue
+            }
+        } else {
+            // Branch 3: Intermediate density graphs (32 < max_degree < 128)
+            if num_sources >= 64 {
+                GpuBfsMethod::IndirectSparseQueuePush
+            } else if num_sources >= 32 {
+                GpuBfsMethod::BitParallel64
+            } else if num_sources > 1 {
+                GpuBfsMethod::BitParallel32
+            } else {
+                GpuBfsMethod::SparseQueue
+            }
+        }
+    }
+
+    /// Resolves the concrete execution method, expanding `Auto` if configured.
+    pub fn resolve_method(&self, graph: &CsrGraph, sources: &[u32]) -> GpuBfsMethod {
+        match self.method {
+            GpuBfsMethod::Auto => Self::select_auto_method(graph, sources.len()),
+            other => other,
+        }
+    }
+
     /// Returns the active execution method.
     pub fn method(&self) -> GpuBfsMethod {
         self.method
@@ -176,7 +233,8 @@ impl GpuBfsEngine {
             out.resize(total, u32::MAX);
         }
 
-        match self.method {
+        let effective_method = self.resolve_method(graph, sources);
+        match effective_method {
             GpuBfsMethod::IndirectSparseQueuePush => {
                 let mut guard = self.persistent_isqp.lock().unwrap();
                 run_indirect_sparse_push_into(
@@ -188,17 +246,21 @@ impl GpuBfsEngine {
                     out,
                 )
             }
-            _ => {
-                let res = self.run_ms_bfs(graph, sources)?;
+            other => {
+                let res = self.run_ms_bfs_with_method(other, graph, sources)?;
                 out.copy_from_slice(&res);
                 Ok(())
             }
         }
     }
-}
 
-impl BfsEngine for GpuBfsEngine {
-    fn run_ms_bfs(&self, graph: &CsrGraph, sources: &[u32]) -> Result<Vec<u32>> {
+    /// Helper method to execute BFS using a resolved method.
+    pub fn run_ms_bfs_with_method(
+        &self,
+        method: GpuBfsMethod,
+        graph: &CsrGraph,
+        sources: &[u32],
+    ) -> Result<Vec<u32>> {
         let num_vertices = graph.num_vertices;
         let num_sources = sources.len();
 
@@ -224,7 +286,11 @@ impl BfsEngine for GpuBfsEngine {
             }
         }
 
-        match self.method {
+        match method {
+            GpuBfsMethod::Auto => {
+                let resolved = Self::select_auto_method(graph, num_sources);
+                self.run_ms_bfs_with_method(resolved, graph, sources)
+            }
             GpuBfsMethod::NaiveSequential => {
                 run_naive_sequential(&self.context, &self.pipelines, graph, sources)
             }
@@ -276,5 +342,12 @@ impl BfsEngine for GpuBfsEngine {
                 run_multi_word_bp_push(&self.context, &self.pipelines, graph, sources)
             }
         }
+    }
+}
+
+impl BfsEngine for GpuBfsEngine {
+    fn run_ms_bfs(&self, graph: &CsrGraph, sources: &[u32]) -> Result<Vec<u32>> {
+        let effective_method = self.resolve_method(graph, sources);
+        self.run_ms_bfs_with_method(effective_method, graph, sources)
     }
 }

@@ -304,6 +304,9 @@ impl GpuContext {
 
         let default_limits = Limits::default();
         let elevated_limits = Limits {
+            max_storage_buffers_per_shader_stage: adapter_limits
+                .max_storage_buffers_per_shader_stage
+                .max(default_limits.max_storage_buffers_per_shader_stage),
             max_storage_buffer_binding_size: adapter_limits
                 .max_storage_buffer_binding_size
                 .min(TWO_GB_U32)

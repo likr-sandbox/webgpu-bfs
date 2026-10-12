@@ -8,6 +8,8 @@ use webgpu_bfs_shaders::{
     MULTI_WORD_BP_FILTER_WGSL, MULTI_WORD_BP_PULL_WGSL, MULTI_WORD_BP_PUSH_WGSL, NAIVE_SPMV_WGSL,
     PREP_HOP_WGSL, PREP_SPARSE_PUSH_HOP_WGSL, RESET_BUFFER_U32_MAX_WGSL, SPARSE_BP_FILTER_WGSL,
     SPARSE_BP_PUSH_WGSL, SPARSE_QUEUE_PUSH_WGSL, PACK_DISTANCES_U32_TO_U16_WGSL,
+    INDIRECT_SPARSE_PUSH_256_WGSL, INDIRECT_SPARSE_PUSH_512_WGSL,
+    INIT_SPARSE_PUSH_SOURCES_256_WGSL, INIT_SPARSE_PUSH_SOURCES_512_WGSL,
 };
 use wgpu::{
     BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType,
@@ -87,6 +89,17 @@ pub struct PipelineCache {
     // Milestone 14: Distance Quantization (u32 -> u16)
     pack_distances_layout: BindGroupLayout,
     pack_distances_pipeline: ComputePipeline,
+
+    // Milestone 17: Multi-Word Sparse Push Pipelines (256 & 512 width)
+    indirect_sparse_push_256_layout: BindGroupLayout,
+    indirect_sparse_push_256_pipeline: ComputePipeline,
+    init_sparse_sources_256_layout: BindGroupLayout,
+    init_sparse_sources_256_pipeline: ComputePipeline,
+
+    indirect_sparse_push_512_layout: BindGroupLayout,
+    indirect_sparse_push_512_pipeline: ComputePipeline,
+    init_sparse_sources_512_layout: BindGroupLayout,
+    init_sparse_sources_512_pipeline: ComputePipeline,
 }
 
 impl PipelineCache {
@@ -457,6 +470,113 @@ impl PipelineCache {
             PACK_DISTANCES_U32_TO_U16_WGSL,
         );
 
+        // Milestone 17: Multi-Word Sparse Push Pipelines (256 & 512 width)
+        let indirect_sparse_push_256_layout =
+            device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+                label: Some("indirect_sparse_push_256_bgl"),
+                entries: &[
+                    Self::bgl_uniform(0),     // uniforms: PushUniforms
+                    Self::bgl_uniform(1),     // state: IterationState
+                    Self::bgl_storage_ro(2),  // row_ptr
+                    Self::bgl_storage_ro(3),  // col_ind
+                    Self::bgl_storage_rw(4),  // queues
+                    Self::bgl_storage_rw(5),  // frontiers
+                    Self::bgl_storage_rw(6),  // visited
+                    Self::bgl_storage_rw(7),  // enqueued
+                    Self::bgl_storage_rw(8),  // queue_sizes
+                    Self::bgl_storage_rw(9),  // dist_bank0
+                    Self::bgl_storage_rw(10), // dist_bank1
+                    Self::bgl_storage_rw(11), // dist_bank2
+                    Self::bgl_storage_rw(12), // dist_bank3
+                ],
+            });
+
+        let indirect_sparse_push_256_pipeline = Self::create_compute_pipeline(
+            device,
+            "indirect_sparse_push_256_pipeline",
+            &indirect_sparse_push_256_layout,
+            INDIRECT_SPARSE_PUSH_256_WGSL,
+        );
+
+        let init_sparse_sources_256_layout =
+            device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+                label: Some("init_sparse_sources_256_bgl"),
+                entries: &[
+                    Self::bgl_uniform(0),    // params: InitSourcesParams
+                    Self::bgl_storage_ro(1), // sources
+                    Self::bgl_storage_rw(2), // frontiers
+                    Self::bgl_storage_rw(3), // visited
+                    Self::bgl_storage_rw(4), // dist_bank0
+                    Self::bgl_storage_rw(5), // dist_bank1
+                    Self::bgl_storage_rw(6), // dist_bank2
+                    Self::bgl_storage_rw(7), // dist_bank3
+                ],
+            });
+
+        let init_sparse_sources_256_pipeline = Self::create_compute_pipeline(
+            device,
+            "init_sparse_sources_256_pipeline",
+            &init_sparse_sources_256_layout,
+            INIT_SPARSE_PUSH_SOURCES_256_WGSL,
+        );
+
+        let indirect_sparse_push_512_layout =
+            device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+                label: Some("indirect_sparse_push_512_bgl"),
+                entries: &[
+                    Self::bgl_uniform(0),     // uniforms: PushUniforms
+                    Self::bgl_uniform(1),     // state: IterationState
+                    Self::bgl_storage_ro(2),  // row_ptr
+                    Self::bgl_storage_ro(3),  // col_ind
+                    Self::bgl_storage_rw(4),  // queues
+                    Self::bgl_storage_rw(5),  // frontiers
+                    Self::bgl_storage_rw(6),  // visited
+                    Self::bgl_storage_rw(7),  // enqueued
+                    Self::bgl_storage_rw(8),  // queue_sizes
+                    Self::bgl_storage_rw(9),  // dist_bank0
+                    Self::bgl_storage_rw(10), // dist_bank1
+                    Self::bgl_storage_rw(11), // dist_bank2
+                    Self::bgl_storage_rw(12), // dist_bank3
+                    Self::bgl_storage_rw(13), // dist_bank4
+                    Self::bgl_storage_rw(14), // dist_bank5
+                    Self::bgl_storage_rw(15), // dist_bank6
+                    Self::bgl_storage_rw(16), // dist_bank7
+                ],
+            });
+
+        let indirect_sparse_push_512_pipeline = Self::create_compute_pipeline(
+            device,
+            "indirect_sparse_push_512_pipeline",
+            &indirect_sparse_push_512_layout,
+            INDIRECT_SPARSE_PUSH_512_WGSL,
+        );
+
+        let init_sparse_sources_512_layout =
+            device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+                label: Some("init_sparse_sources_512_bgl"),
+                entries: &[
+                    Self::bgl_uniform(0),     // params: InitSourcesParams
+                    Self::bgl_storage_ro(1),  // sources
+                    Self::bgl_storage_rw(2),  // frontiers
+                    Self::bgl_storage_rw(3),  // visited
+                    Self::bgl_storage_rw(4),  // dist_bank0
+                    Self::bgl_storage_rw(5),  // dist_bank1
+                    Self::bgl_storage_rw(6),  // dist_bank2
+                    Self::bgl_storage_rw(7),  // dist_bank3
+                    Self::bgl_storage_rw(8),  // dist_bank4
+                    Self::bgl_storage_rw(9),  // dist_bank5
+                    Self::bgl_storage_rw(10), // dist_bank6
+                    Self::bgl_storage_rw(11), // dist_bank7
+                ],
+            });
+
+        let init_sparse_sources_512_pipeline = Self::create_compute_pipeline(
+            device,
+            "init_sparse_sources_512_pipeline",
+            &init_sparse_sources_512_layout,
+            INIT_SPARSE_PUSH_SOURCES_512_WGSL,
+        );
+
         Ok(Self {
             naive_layout,
             naive_pipeline,
@@ -498,6 +618,14 @@ impl PipelineCache {
             init_sparse_sources_pipeline,
             pack_distances_layout,
             pack_distances_pipeline,
+            indirect_sparse_push_256_layout,
+            indirect_sparse_push_256_pipeline,
+            init_sparse_sources_256_layout,
+            init_sparse_sources_256_pipeline,
+            indirect_sparse_push_512_layout,
+            indirect_sparse_push_512_pipeline,
+            init_sparse_sources_512_layout,
+            init_sparse_sources_512_pipeline,
         })
     }
 
@@ -787,6 +915,39 @@ impl PipelineCache {
 
     pub fn pack_distances_pipeline(&self) -> &ComputePipeline {
         &self.pack_distances_pipeline
+    }
+
+    // Milestone 17: Multi-Word Sparse Push Pipelines (256 & 512 width)
+    pub fn indirect_sparse_push_256_layout(&self) -> &BindGroupLayout {
+        &self.indirect_sparse_push_256_layout
+    }
+
+    pub fn indirect_sparse_push_256_pipeline(&self) -> &ComputePipeline {
+        &self.indirect_sparse_push_256_pipeline
+    }
+
+    pub fn init_sparse_sources_256_layout(&self) -> &BindGroupLayout {
+        &self.init_sparse_sources_256_layout
+    }
+
+    pub fn init_sparse_sources_256_pipeline(&self) -> &ComputePipeline {
+        &self.init_sparse_sources_256_pipeline
+    }
+
+    pub fn indirect_sparse_push_512_layout(&self) -> &BindGroupLayout {
+        &self.indirect_sparse_push_512_layout
+    }
+
+    pub fn indirect_sparse_push_512_pipeline(&self) -> &ComputePipeline {
+        &self.indirect_sparse_push_512_pipeline
+    }
+
+    pub fn init_sparse_sources_512_layout(&self) -> &BindGroupLayout {
+        &self.init_sparse_sources_512_layout
+    }
+
+    pub fn init_sparse_sources_512_pipeline(&self) -> &ComputePipeline {
+        &self.init_sparse_sources_512_pipeline
     }
 }
 

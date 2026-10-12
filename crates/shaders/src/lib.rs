@@ -69,6 +69,18 @@ pub const INIT_SPARSE_PUSH_SOURCES_WGSL: &str = include_str!("init_sparse_push_s
 /// WGSL shader source for packing u32 distances to u16 (Milestone M14).
 pub const PACK_DISTANCES_U32_TO_U16_WGSL: &str = include_str!("pack_distances_u32_to_u16.wgsl");
 
+/// WGSL shader source for 256-source multi-word sparse push traversal (Milestone M16).
+pub const INDIRECT_SPARSE_PUSH_256_WGSL: &str = include_str!("indirect_sparse_push_256.wgsl");
+
+/// WGSL shader source for 512-source multi-word sparse push traversal (Milestone M16).
+pub const INDIRECT_SPARSE_PUSH_512_WGSL: &str = include_str!("indirect_sparse_push_512.wgsl");
+
+/// WGSL shader source for GPU source initialization for 256-source sparse push (Milestone M16).
+pub const INIT_SPARSE_PUSH_SOURCES_256_WGSL: &str = include_str!("init_sparse_push_sources_256.wgsl");
+
+/// WGSL shader source for GPU source initialization for 512-source sparse push (Milestone M16).
+pub const INIT_SPARSE_PUSH_SOURCES_512_WGSL: &str = include_str!("init_sparse_push_sources_512.wgsl");
+
 /// Returns a slice of tuples containing (filename, shader_source) for all embedded shaders.
 pub fn all_shaders() -> &'static [(&'static str, &'static str)] {
     &[
@@ -94,6 +106,10 @@ pub fn all_shaders() -> &'static [(&'static str, &'static str)] {
         ("reset_buffer_u32_max.wgsl", RESET_BUFFER_U32_MAX_WGSL),
         ("init_sparse_push_sources.wgsl", INIT_SPARSE_PUSH_SOURCES_WGSL),
         ("pack_distances_u32_to_u16.wgsl", PACK_DISTANCES_U32_TO_U16_WGSL),
+        ("indirect_sparse_push_256.wgsl", INDIRECT_SPARSE_PUSH_256_WGSL),
+        ("indirect_sparse_push_512.wgsl", INDIRECT_SPARSE_PUSH_512_WGSL),
+        ("init_sparse_push_sources_256.wgsl", INIT_SPARSE_PUSH_SOURCES_256_WGSL),
+        ("init_sparse_push_sources_512.wgsl", INIT_SPARSE_PUSH_SOURCES_512_WGSL),
     ]
 }
 
@@ -229,5 +245,25 @@ mod tests {
     #[test]
     fn test_pack_distances_u32_to_u16_syntax() {
         validate_wgsl_shader("pack_distances_u32_to_u16.wgsl", PACK_DISTANCES_U32_TO_U16_WGSL);
+    }
+
+    #[test]
+    fn test_indirect_sparse_push_256_syntax() {
+        validate_wgsl_shader("indirect_sparse_push_256.wgsl", INDIRECT_SPARSE_PUSH_256_WGSL);
+    }
+
+    #[test]
+    fn test_indirect_sparse_push_512_syntax() {
+        validate_wgsl_shader("indirect_sparse_push_512.wgsl", INDIRECT_SPARSE_PUSH_512_WGSL);
+    }
+
+    #[test]
+    fn test_init_sparse_push_sources_256_syntax() {
+        validate_wgsl_shader("init_sparse_push_sources_256.wgsl", INIT_SPARSE_PUSH_SOURCES_256_WGSL);
+    }
+
+    #[test]
+    fn test_init_sparse_push_sources_512_syntax() {
+        validate_wgsl_shader("init_sparse_push_sources_512.wgsl", INIT_SPARSE_PUSH_SOURCES_512_WGSL);
     }
 }

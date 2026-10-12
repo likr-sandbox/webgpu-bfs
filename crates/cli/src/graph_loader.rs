@@ -17,7 +17,11 @@ pub fn load_graph_and_sources(
     graph_args: &GraphInputArgs,
     source_args: &SourceArgs,
 ) -> Result<(String, CsrGraph, Vec<u32>)> {
-    let (name, graph) = load_graph(graph_args)?;
+    let (name, mut graph) = load_graph(graph_args)?;
+    if !graph.is_symmetric() {
+        log::info!("Treating directed graph '{}' as undirected (symmetrizing edges).", name);
+        graph = graph.to_undirected();
+    }
     let sources = sample_sources(&graph, source_args, graph_args.seed)?;
     Ok((name, graph, sources))
 }
@@ -28,7 +32,7 @@ fn load_graph(args: &GraphInputArgs) -> Result<(String, CsrGraph)> {
     }
 
     if let Some(ref dataset_name) = args.dataset {
-        let path = dataset::ensure_dataset_downloaded(dataset_name, Path::new("data"), false)?;
+        let path = dataset::ensure_dataset(dataset_name, Path::new("data"), false)?;
         return load_mtx_file(&path);
     }
 
@@ -89,8 +93,12 @@ fn load_graph(args: &GraphInputArgs) -> Result<(String, CsrGraph)> {
 fn load_mtx_file(path: &Path) -> Result<(String, CsrGraph)> {
     let file = File::open(path).with_context(|| format!("Cannot open MTX file {:?}", path))?;
     let reader = BufReader::new(file);
-    let graph = CsrGraph::from_mtx_reader(reader)
+    let mut graph = CsrGraph::from_mtx_reader(reader)
         .with_context(|| format!("Failed to parse MTX file {:?}", path))?;
+    if !graph.is_symmetric() {
+        log::info!("Treating directed MTX file {:?} as undirected (symmetrizing edges).", path);
+        graph = graph.to_undirected();
+    }
     let stem = path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -131,6 +139,12 @@ pub fn sample_sources(graph: &CsrGraph, args: &SourceArgs, seed: Option<u64>) ->
         if explicit.is_empty() {
             bail!("Explicit sources list cannot be empty");
         }
+        if explicit.len() == 1 && explicit[0] >= 32 {
+            log::info!(
+                "Executing MS-BFS with 1 explicit source vertex ({}). To sample a batch of {} sources, use -s {} or --num-sources {}.",
+                explicit[0], explicit[0], explicit[0], explicit[0]
+            );
+        }
         for &s in explicit {
             if s as usize >= nv {
                 bail!(
@@ -143,7 +157,14 @@ pub fn sample_sources(graph: &CsrGraph, args: &SourceArgs, seed: Option<u64>) ->
         return Ok(explicit.clone());
     }
 
-    let count = args.num_sources.unwrap_or(1).min(nv);
+    let requested = args.num_sources.unwrap_or(1);
+    let count = requested.min(nv);
+    if requested > nv {
+        log::warn!(
+            "Requested {} sources, but graph has only {} vertices; clamping to {}",
+            requested, nv, count
+        );
+    }
     if count == 0 {
         bail!("Number of sources must be >= 1");
     }

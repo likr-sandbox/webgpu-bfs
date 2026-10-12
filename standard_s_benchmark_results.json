@@ -1,0 +1,102 @@
+{
+  "web-Stanford": {
+    "1": {
+      "cpu_single_ms": 63.076772000000005,
+      "cpu_multi_ms": 51.509453,
+      "best_gpu_method": "GPU Auto (Topology-Aware)",
+      "best_gpu_ms": 179.9889675,
+      "speedup_vs_single": 0.35044799065253823,
+      "speedup_vs_multi": 0.2861811682985514
+    },
+    "16": {
+      "cpu_single_ms": 1001.199289,
+      "cpu_multi_ms": 261.44845150000003,
+      "best_gpu_method": "GPU Auto (Topology-Aware)",
+      "best_gpu_ms": 209.727791,
+      "speedup_vs_single": 4.773803625290651,
+      "speedup_vs_multi": 1.246608521709934
+    },
+    "64": {
+      "cpu_single_ms": 524.327522,
+      "cpu_multi_ms": 136.173682,
+      "best_gpu_method": "GPU Auto (Topology-Aware)",
+      "best_gpu_ms": 136.38667900000002,
+      "speedup_vs_single": 3.844418867329411,
+      "speedup_vs_multi": 0.9984382858974079
+    },
+    "256": {
+      "cpu_single_ms": 2236.3348594999998,
+      "cpu_multi_ms": 549.2198685,
+      "best_gpu_method": "GPU Auto (Topology-Aware)",
+      "best_gpu_ms": 281.39086999999995,
+      "speedup_vs_single": 7.947432194583997,
+      "speedup_vs_multi": 1.951804152352207
+    },
+    "1024": {
+      "cpu_single_ms": 8297.588715499998,
+      "cpu_multi_ms": 1837.528741,
+      "best_gpu_method": "GPU Auto (Topology-Aware)",
+      "best_gpu_ms": 1020.269485,
+      "speedup_vs_single": 8.13274221908146,
+      "speedup_vs_multi": 1.8010229336614925
+    },
+    "2048": {
+      "cpu_single_ms": 16149.194117500001,
+      "cpu_multi_ms": 4813.6291395,
+      "best_gpu_method": "GPU Auto (Topology-Aware)",
+      "best_gpu_ms": 2031.4188589999999,
+      "speedup_vs_single": 7.949711624440522,
+      "speedup_vs_multi": 2.369589667917915
+    }
+  },
+  "luxembourg_osm": {
+    "1": {
+      "cpu_single_ms": 1.626759,
+      "cpu_multi_ms": 1.3684129999999999,
+      "best_gpu_method": "GPU Auto (Topology-Aware)",
+      "best_gpu_ms": 158.300961,
+      "speedup_vs_single": 0.010276368442261067,
+      "speedup_vs_multi": 0.008644375822835339
+    },
+    "16": {
+      "cpu_single_ms": 25.7555005,
+      "cpu_multi_ms": 6.5246580000000005,
+      "best_gpu_method": "GPU Auto (Topology-Aware)",
+      "best_gpu_ms": 176.21651,
+      "speedup_vs_single": 0.14615827143551985,
+      "speedup_vs_multi": 0.03702637170603368
+    },
+    "64": {
+      "cpu_single_ms": 137.0059685,
+      "cpu_multi_ms": 24.921916000000003,
+      "best_gpu_method": "GPU Auto (Topology-Aware)",
+      "best_gpu_ms": 217.349322,
+      "speedup_vs_single": 0.6303491873786475,
+      "speedup_vs_multi": 0.11466295717269366
+    },
+    "256": {
+      "cpu_single_ms": 497.29231849999996,
+      "cpu_multi_ms": 99.770218,
+      "best_gpu_method": "GPU Auto (Topology-Aware)",
+      "best_gpu_ms": 856.267107,
+      "speedup_vs_single": 0.5807677469268944,
+      "speedup_vs_multi": 0.11651763472446454
+    },
+    "1024": {
+      "cpu_single_ms": 1872.5684139999998,
+      "cpu_multi_ms": 349.6886535,
+      "best_gpu_method": "GPU Auto (Topology-Aware)",
+      "best_gpu_ms": 3231.3532800000003,
+      "speedup_vs_single": 0.579499748786366,
+      "speedup_vs_multi": 0.10821740094602096
+    },
+    "2048": {
+      "cpu_single_ms": 3839.2183625,
+      "cpu_multi_ms": 720.9641845,
+      "best_gpu_method": "GPU Auto (Topology-Aware)",
+      "best_gpu_ms": 6548.264784999999,
+      "speedup_vs_single": 0.5862955284420436,
+      "speedup_vs_multi": 0.11010003537906723
+    }
+  }
+}

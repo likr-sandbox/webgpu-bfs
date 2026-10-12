@@ -258,6 +258,13 @@ impl BenchmarkHarness {
                 )?),
                 "GPU MultiWordBitParallelPush".to_string(),
             ),
+            MethodArg::Auto => (
+                BenchEngine::Gpu(GpuBfsEngine::new(
+                    self.context.clone(),
+                    GpuBfsMethod::Auto,
+                )?),
+                "GPU Auto (Topology-Aware)".to_string(),
+            ),
             MethodArg::All => unreachable!(),
         };
 
