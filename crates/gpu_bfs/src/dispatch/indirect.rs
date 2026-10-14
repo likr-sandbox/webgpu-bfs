@@ -61,9 +61,9 @@ pub struct IndirectMacroBatchBfs {
     ctx: Arc<GpuContext>,
     pipelines: Arc<PipelineCache>,
     #[allow(dead_code)]
-    row_offsets_buf: wgpu::Buffer,
+    row_offsets_buf: Arc<wgpu::Buffer>,
     #[allow(dead_code)]
-    col_indices_buf: wgpu::Buffer,
+    col_indices_buf: Arc<wgpu::Buffer>,
     frontier_buf_a: wgpu::Buffer,
     frontier_buf_b: wgpu::Buffer,
     visited_buf: wgpu::Buffer,

@@ -46,6 +46,13 @@ A high-performance GPU-parallel Multi-Source Breadth-First Search (MS-BFS) libra
 | F13 | WASM / Browser WebGPU Demo | `wasm-bindgen` export + modern HTML/JS/CSS WebGPU demo page with UI controls and benchmark execution | M5 | ORIGINAL_REQUEST §R3 |
 | F14 | SuiteSparse Luxembourg Pipeline | Automated download, extraction, validation, and execution on `luxembourg_osm` dataset | M6 | ORIGINAL_REQUEST §R4 |
 | F15 | Benchmark Suite & Reports | Graph500 Harmonic MTEPS measurement, 6-way algorithmic comparison (Markdown, CSV, JSON), documentation | M6 | ORIGINAL_REQUEST §R4, §Acceptance |
+| F16 | Multi-Word Bit-Parallel Pull | 512-source 8-bank pull traversal with 0 barriers, 0 LDS bytes, dirty-check ping-pong, and single-counter termination | M19, M23 | ORIGINAL_REQUEST §R2 |
+| F17 | Indirect Sparse Queue Push (ISQP) | Fused GPU-autonomous sparse push with workgroup hub expansion, LDS queue, u16 quantization, and adaptive macro-batching | M12, M16-M18, M20, M23 | ORIGINAL_REQUEST §R1, §R3 |
+| F18 | Topology-Adaptive Auto Router | Degree-skew and batch-aware deterministic algorithm selector for optimal performance across all graph topologies | M17, M21, M22 | ORIGINAL_REQUEST §R1 |
+| F19 | Fractional Batch Single-Pass Routing | Direct single-pass dispatch for fractional batches ($256 < S \le 512 \to \text{pool\_512}$, $64 < S \le 256 \to \text{pool\_256}$) with dynamic word masking | M22 | ORIGINAL_REQUEST §R2 |
+| F20 | Exact Distance Buffer Reset & Word Guarding | Bounding memory reset to actual $S \times \|V\|$ elements, reducing $S=1$ initialization by $64\times$ | M22 | ORIGINAL_REQUEST §R1 |
+| F21 | High-Diameter Scaling & Pull Barrier Elimination | Elimination of all 8 tree barriers/WG, dirty check skipping ~9.6 GB DRAM writes per pass, and $160 \to 512$ hop adaptive scaling | M23 | ORIGINAL_REQUEST §R3 |
+| F22 | Symmetric Graph Buffer Deduplication | Zero-duplicate memory aliasing for CSC/CSR graph topology via `Arc<wgpu::Buffer>` and `from_symmetric_graph` | M23 | ORIGINAL_REQUEST §R1 |
 
 ---
 
@@ -58,6 +65,14 @@ A high-performance GPU-parallel Multi-Source Breadth-First Search (MS-BFS) libra
 | M4 | Dual-Track E2E Test Suite | Test runner, Tiers 1-4 automated test suite (50+ cases), topological edge cases, `TEST_READY.md` publication | M3 | DONE |
 | M5 | Native CLI & WASM Web Demo | `crates/cli` binary with full flags, `crates/wasm` package, `web/` HTML/JS WebGPU demo frontend | M3 | DONE |
 | M6 | SuiteSparse Luxembourg & Benchmarks | Automated `luxembourg_osm` loader, comprehensive benchmark harness, MTEPS reporting, README & performance documentation | M4, M5 | DONE |
+| M7–M10 | Luxembourg OSM Reversal & Massive Multi-Source | 2D warp-tile pull, hardware target analysis (19k sources/s), sparse queue compaction, 256–2048 multi-source batching | M6 | DONE |
+| M11–M14 | WSL2 Hardware Direct & web-Stanford CPU Reversal | WSL2 Direct3D 12 enablement, 64-bit ISQP, LDS active queue, GPU in-place u16 quantization, persistent buffer pooling | M10 | DONE |
+| M15–M18 | Undirected Scale-Free Reversal ($S \le 2048$) | Degree-aware collaborative hub expansion, 512/256-bit multi-word push, multi-bank distance buffers (128 MB limit bypass), topology router `Auto` | M14 | DONE |
+| M19 | High-Diameter Multi-Bank Pull Scaling | 8-bank 512-source pull shader, single-encoder DMA & u16 quantization, 4-pass $S=2048$ execution (2,686 ms) | M18 | DONE |
+| M20 | 3rd-Gen Collaborative Hub Architecture | Phase 0 subwarp cooperative load, 2,048-entry LDS queue, 4-quadrant atomics, stride 256 ultra-hub unrolling (5,091 MTEPS) | M18 | DONE |
+| M21 | Topology Router Verification & Complete Parity | Deterministic `Auto` router testing across degree/batch boundaries, workspace-wide bitwise parity verification | M19, M20 | DONE |
+| M22 | Sparse Push Fractional Batch & Reset Optimization | Single-pass fractional routing ($S=128 < S=256$, $S=384 < S=512$), exact $S \times \|V\|$ reset, M20 horizontal expansion to 256/64 shaders, $S \ge 1$ `Auto` routing | M21 | DONE |
+| M23 | High-Diameter Scaling & Pull Barrier Elimination | 0-barrier & 0-LDS pull kernel, dirty-check ping-pong zeroing, adaptive macro-batching ($160 \to 512$ hops), single final-counter check, `Arc<Buffer>` deduplication | M22 | DONE |
 
 ---
 
@@ -98,14 +113,23 @@ pub trait BfsEngine {
 
 ### `crates/gpu_bfs` Method Selection Enum
 ```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GpuBfsMethod {
+    #[default]
     NaiveSequential,
     BatchedDenseSpMM,
     BitParallel32,
     BitParallel64,
+    BitParallel64Pull,
     BooleanReachability,
     PushPullAdaptive,
+    SparseQueue,
+    SparseBitParallel64,
+    MultiWordBitParallel,
+    IndirectMacroBatch,
+    IndirectSparseQueuePush,
+    MultiWordBitParallelPush,
+    Auto,
 }
 ```
 

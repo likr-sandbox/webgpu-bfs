@@ -162,13 +162,9 @@ impl GpuBfsEngine {
             }
         } else if max_degree >= 128 {
             // Branch 2: Scale-free power-law graphs with massive hubs
-            if num_sources >= 64 {
-                GpuBfsMethod::IndirectSparseQueuePush
-            } else if num_sources > 1 {
-                GpuBfsMethod::BitParallel64
-            } else {
-                GpuBfsMethod::SparseQueue
-            }
+            // M22: Pooled IndirectSparseQueuePush with exact reset and M20 hub optimizations
+            // is strictly superior across all batch sizes (S >= 1).
+            GpuBfsMethod::IndirectSparseQueuePush
         } else {
             // Branch 3: Intermediate density graphs (32 < max_degree < 128)
             if num_sources >= 64 {
@@ -514,51 +510,16 @@ mod tests {
             let g = make_graph_with_max_degree(deg);
             assert_eq!(g.max_degree(), deg);
 
-            // S = 1 -> SparseQueue
-            assert_eq!(
-                GpuBfsEngine::select_auto_method(&g, 1),
-                GpuBfsMethod::SparseQueue
-            );
-
-            // 1 < S < 64 -> BitParallel64
-            assert_eq!(
-                GpuBfsEngine::select_auto_method(&g, 2),
-                GpuBfsMethod::BitParallel64
-            );
-            assert_eq!(
-                GpuBfsEngine::select_auto_method(&g, 16),
-                GpuBfsMethod::BitParallel64
-            );
-            assert_eq!(
-                GpuBfsEngine::select_auto_method(&g, 32),
-                GpuBfsMethod::BitParallel64
-            );
-            assert_eq!(
-                GpuBfsEngine::select_auto_method(&g, 63),
-                GpuBfsMethod::BitParallel64
-            );
-
-            // S >= 64 -> IndirectSparseQueuePush
-            assert_eq!(
-                GpuBfsEngine::select_auto_method(&g, 64),
-                GpuBfsMethod::IndirectSparseQueuePush
-            );
-            assert_eq!(
-                GpuBfsEngine::select_auto_method(&g, 256),
-                GpuBfsMethod::IndirectSparseQueuePush
-            );
-            assert_eq!(
-                GpuBfsEngine::select_auto_method(&g, 512),
-                GpuBfsMethod::IndirectSparseQueuePush
-            );
-            assert_eq!(
-                GpuBfsEngine::select_auto_method(&g, 1024),
-                GpuBfsMethod::IndirectSparseQueuePush
-            );
-            assert_eq!(
-                GpuBfsEngine::select_auto_method(&g, 2048),
-                GpuBfsMethod::IndirectSparseQueuePush
-            );
+            // M22: Scale-free power-law graphs with massive hubs route all S >= 1 to IndirectSparseQueuePush
+            for &s in &[1, 2, 16, 32, 63, 64, 128, 256, 384, 512, 1024, 2048] {
+                assert_eq!(
+                    GpuBfsEngine::select_auto_method(&g, s),
+                    GpuBfsMethod::IndirectSparseQueuePush,
+                    "Failed for max_degree {} and S {}",
+                    deg,
+                    s
+                );
+            }
         }
     }
 }

@@ -89,73 +89,121 @@ impl CsrGpuBuffers {
     }
 }
 
+use std::sync::Arc;
+
 /// GPU storage buffers holding both CSR (Push) and CSC (Pull) representations.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PushPullGraphBuffers {
-    pub csr_row_offsets: Buffer,
-    pub csr_col_indices: Buffer,
-    pub csc_col_offsets: Buffer,
-    pub csc_row_indices: Buffer,
+    pub csr_row_offsets: Arc<Buffer>,
+    pub csr_col_indices: Arc<Buffer>,
+    pub csc_col_offsets: Arc<Buffer>,
+    pub csc_row_indices: Arc<Buffer>,
     pub num_vertices: usize,
     pub num_edges: usize,
     pub is_symmetric: bool,
 }
 
 impl PushPullGraphBuffers {
-    /// Uploads a CPU `CsrGraph` and its transpose (`CscGraph`) into GPU storage buffers.
-    ///
-    /// Reuses CSR buffers for CSC if the graph is symmetric.
-    pub fn from_graph(ctx: &GpuContext, graph: &CsrGraph) -> Self {
-        let is_symmetric = graph.is_symmetric();
+    /// Uploads a known-symmetric `CsrGraph` directly sharing CSR buffers as CSC without transpose.
+    pub fn from_symmetric_graph(ctx: &GpuContext, graph: &CsrGraph) -> Self {
         let dummy_col = [0u32];
 
-        let csr_row_offsets = ctx.create_storage_buffer_init(
+        let csr_row_offsets = Arc::new(ctx.create_storage_buffer_init(
             "csr_row_offsets",
             &graph.row_offsets,
             BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-        );
+        ));
 
         let col_slice: &[u32] = if graph.col_indices.is_empty() {
             &dummy_col
         } else {
             &graph.col_indices
         };
-        let csr_col_indices = ctx.create_storage_buffer_init(
+        let csr_col_indices = Arc::new(ctx.create_storage_buffer_init(
             "csr_col_indices",
             col_slice,
             BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-        );
+        ));
 
-        let (csc_col_offsets, csc_row_indices) = if is_symmetric {
-            let col_offsets = ctx.create_storage_buffer_init(
-                "csc_col_offsets_sym",
-                &graph.row_offsets,
-                BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            );
-            let row_indices = ctx.create_storage_buffer_init(
-                "csc_row_indices_sym",
-                col_slice,
-                BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            );
-            (col_offsets, row_indices)
+        let csc_col_offsets = Arc::clone(&csr_row_offsets);
+        let csc_row_indices = Arc::clone(&csr_col_indices);
+
+        Self {
+            csr_row_offsets,
+            csr_col_indices,
+            csc_col_offsets,
+            csc_row_indices,
+            num_vertices: graph.num_vertices,
+            num_edges: graph.num_edges,
+            is_symmetric: true,
+        }
+    }
+
+    /// Uploads a CPU `CsrGraph` and its transpose (`CscGraph`) into GPU storage buffers.
+    ///
+    /// Reuses CSR buffers for CSC if the graph is symmetric.
+    pub fn from_graph(ctx: &GpuContext, graph: &CsrGraph) -> Self {
+        let dummy_col = [0u32];
+
+        let csr_row_offsets = Arc::new(ctx.create_storage_buffer_init(
+            "csr_row_offsets",
+            &graph.row_offsets,
+            BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+        ));
+
+        let col_slice: &[u32] = if graph.col_indices.is_empty() {
+            &dummy_col
         } else {
+            &graph.col_indices
+        };
+        let csr_col_indices = Arc::new(ctx.create_storage_buffer_init(
+            "csr_col_indices",
+            col_slice,
+            BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+        ));
+
+        // Fast odd-edge rejection: in simple undirected graphs, num_edges must be even
+        let (csc_col_offsets, csc_row_indices, is_symmetric) = if graph.num_edges % 2 != 0 {
             let csc = graph.to_csc();
-            let col_offsets = ctx.create_storage_buffer_init(
+            let col_offsets = Arc::new(ctx.create_storage_buffer_init(
                 "csc_col_offsets",
                 &csc.col_offsets,
                 BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            );
+            ));
             let row_slice: &[u32] = if csc.row_indices.is_empty() {
                 &dummy_col
             } else {
                 &csc.row_indices
             };
-            let row_indices = ctx.create_storage_buffer_init(
+            let row_indices = Arc::new(ctx.create_storage_buffer_init(
                 "csc_row_indices",
                 row_slice,
                 BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            );
-            (col_offsets, row_indices)
+            ));
+            (col_offsets, row_indices, false)
+        } else {
+            let csc = graph.to_csc();
+            let is_sym = graph.row_offsets == csc.col_offsets && graph.col_indices == csc.row_indices;
+            if is_sym {
+                (Arc::clone(&csr_row_offsets), Arc::clone(&csr_col_indices), true)
+            } else {
+                let col_offsets = Arc::new(ctx.create_storage_buffer_init(
+                    "csc_col_offsets",
+                    &csc.col_offsets,
+                    BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+                ));
+                let row_slice: &[u32] = if csc.row_indices.is_empty() {
+                    &dummy_col
+                } else {
+                    &csc.row_indices
+                };
+                let row_indices = Arc::new(ctx.create_storage_buffer_init(
+                    "csc_row_indices",
+                    row_slice,
+                    BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+                ));
+                (col_offsets, row_indices, false)
+            }
         };
 
         Self {

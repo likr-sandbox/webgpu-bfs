@@ -5,7 +5,7 @@ struct PushUniforms {
     num_vertices: u32,
     chunk_start: u32,      // Global source offset (e.g. 0, 64, 128...)
     hub_threshold: u32,    // Degree threshold for collaborative workgroup expansion (e.g. 128u or 256u)
-    pad1: u32,
+    num_words: u32,        // Number of active words (e.g. 1 or 2)
 };
 
 struct IterationState {
@@ -29,18 +29,89 @@ struct IterationState {
 const SUB_WARP_SIZE: u32 = 4u;
 const NUM_SUB_WARPS: u32 = 16u;
 const WG_SIZE: u32 = 64u;
-const WG_QUEUE_CAP: u32 = 1024u;
+const WG_QUEUE_CAP: u32 = 2048u;
+const SUB_QUEUE_CAP: u32 = 512u; // WG_QUEUE_CAP / 4u
 const DEFAULT_HUB_THRESHOLD: u32 = 128u;
+const ULTRA_HUB_THRESHOLD: u32 = 1024u;
+const MAX_WORDS: u32 = 2u;
 
-var<workgroup> s_f0: array<u32, NUM_SUB_WARPS>;
-var<workgroup> s_f1: array<u32, NUM_SUB_WARPS>;
+var<workgroup> s_f: array<u32, 32>; // NUM_SUB_WARPS * MAX_WORDS = 16 * 2 = 32
+var<workgroup> s_active_mask: array<atomic<u32>, NUM_SUB_WARPS>;
 var<workgroup> s_start_edge: array<u32, NUM_SUB_WARPS>;
 var<workgroup> s_end_edge: array<u32, NUM_SUB_WARPS>;
 var<workgroup> s_has_hub: atomic<u32>;
 
 var<workgroup> wg_queue_items: array<u32, WG_QUEUE_CAP>;
-var<workgroup> wg_queue_count: atomic<u32>;
-var<workgroup> wg_global_offset: u32;
+var<workgroup> s_sub_queue_count: array<atomic<u32>, 4>;
+var<workgroup> s_sub_offsets: array<u32, 4>;
+var<workgroup> s_sub_counts: array<u32, 4>;
+
+fn write_distance_bits(w_offset: u32, mut_bits: u32, v: u32, nv: u32, cur_level: u32) {
+    var bits = mut_bits;
+    while (bits != 0u) {
+        let bit_pos = countTrailingZeros(bits);
+        distance[(w_offset + bit_pos) * nv + v] = cur_level;
+        bits = bits & (bits - 1u);
+    }
+}
+
+fn process_neighbor(
+    v: u32,
+    sub_idx: u32,
+    active_mask: u32,
+    nv: u32,
+    cur_level: u32,
+    out_frontier_base: u32,
+    out_queue_base: u32,
+    out_slot: u32,
+    qid: u32,
+) {
+    let v_vis_base = v * MAX_WORDS;
+    var newly_discovered = false;
+    var words_to_process = active_mask;
+
+    while (words_to_process != 0u) {
+        let w = countTrailingZeros(words_to_process);
+        words_to_process = words_to_process & (words_to_process - 1u);
+
+        let f = s_f[sub_idx * MAX_WORDS + w];
+        let vis = atomicLoad(&visited[v_vis_base + w]);
+        let needed = f & (~vis);
+
+        if (needed == 0u) {
+            continue;
+        }
+
+        let prev = atomicOr(&visited[v_vis_base + w], needed);
+        let newly = needed & (~prev);
+
+        if (newly == 0u) {
+            continue;
+        }
+
+        newly_discovered = true;
+
+        let w_offset = uniforms.chunk_start + w * 32u;
+        write_distance_bits(w_offset, newly, v, nv, cur_level);
+
+        let v_out_idx = out_frontier_base + v * MAX_WORDS + w;
+        atomicOr(&frontiers[v_out_idx], newly);
+    }
+
+    if (newly_discovered) {
+        if (atomicLoad(&enqueued[v]) != cur_level) {
+            if (atomicExchange(&enqueued[v], cur_level) != cur_level) {
+                let sub_slot = atomicAdd(&s_sub_queue_count[qid], 1u);
+                if (sub_slot < SUB_QUEUE_CAP) {
+                    wg_queue_items[qid * SUB_QUEUE_CAP + sub_slot] = v;
+                } else {
+                    let slot = atomicAdd(&queue_sizes[out_slot], 1u);
+                    queues[out_queue_base + slot] = v;
+                }
+            }
+        }
+    }
+}
 
 @compute @workgroup_size(WG_SIZE)
 fn main(
@@ -54,43 +125,57 @@ fn main(
     let in_size = atomicLoad(&queue_sizes[in_slot]);
     let in_queue_base = in_slot * nv;
     let out_queue_base = out_slot * nv;
-    let in_frontier_base = in_slot * (2u * nv);
-    let out_frontier_base = out_slot * (2u * nv);
+    let in_frontier_base = in_slot * (MAX_WORDS * nv);
+    let out_frontier_base = out_slot * (MAX_WORDS * nv);
 
     let sub_id = local_id.x / SUB_WARP_SIZE;
     let sub_lane = local_id.x % SUB_WARP_SIZE;
+    let qid = local_id.x & 3u;
 
     let hub_thresh = select(DEFAULT_HUB_THRESHOLD, uniforms.hub_threshold, uniforms.hub_threshold > 0u);
 
+    if (local_id.x < NUM_SUB_WARPS) {
+        atomicStore(&s_active_mask[local_id.x], 0u);
+        s_start_edge[local_id.x] = 0u;
+        s_end_edge[local_id.x] = 0u;
+    }
+    if (local_id.x < 4u) {
+        atomicStore(&s_sub_queue_count[local_id.x], 0u);
+    }
     if (local_id.x == 0u) {
-        atomicStore(&wg_queue_count, 0u);
         atomicStore(&s_has_hub, 0u);
     }
+    workgroupBarrier();
 
-    // Phase 0: Sub-warps load vertices from input queue into LDS
-    if (sub_lane == 0u) {
-        s_f0[sub_id] = 0u;
-        s_f1[sub_id] = 0u;
-        s_start_edge[sub_id] = 0u;
-        s_end_edge[sub_id] = 0u;
-
-        let in_queue_idx = group_id.x * NUM_SUB_WARPS + sub_id;
-        if (in_queue_idx < in_size) {
-            let u = queues[in_queue_base + in_queue_idx];
-            if (u < nv) {
-                let u_idx0 = in_frontier_base + u * 2u;
-                let f0 = atomicExchange(&frontiers[u_idx0], 0u);
-                let f1 = atomicExchange(&frontiers[u_idx0 + 1u], 0u);
-                if (f0 != 0u || f1 != 0u) {
-                    let start_e = row_ptr[u];
-                    let end_e = row_ptr[u + 1u];
-                    s_f0[sub_id] = f0;
-                    s_f1[sub_id] = f1;
-                    s_start_edge[sub_id] = start_e;
-                    s_end_edge[sub_id] = end_e;
-                    if ((end_e - start_e) >= hub_thresh) {
-                        atomicStore(&s_has_hub, 1u);
+    // Phase 0: Sub-warps cooperatively load vertices from input queue into LDS
+    let in_queue_idx = group_id.x * NUM_SUB_WARPS + sub_id;
+    if (in_queue_idx < in_size) {
+        let u = queues[in_queue_base + in_queue_idx];
+        if (u < nv) {
+            let u_base = in_frontier_base + u * MAX_WORDS;
+            var lane_mask = 0u;
+            if (sub_lane < MAX_WORDS) {
+                let w = sub_lane;
+                if (w < uniforms.num_words) {
+                    let f = atomicExchange(&frontiers[u_base + w], 0u);
+                    s_f[sub_id * MAX_WORDS + w] = f;
+                    if (f != 0u) {
+                        lane_mask = lane_mask | (1u << w);
                     }
+                } else {
+                    s_f[sub_id * MAX_WORDS + w] = 0u;
+                }
+            }
+            if (lane_mask != 0u) {
+                atomicOr(&s_active_mask[sub_id], lane_mask);
+            }
+            if (sub_lane == 0u) {
+                let start_e = row_ptr[u];
+                let end_e = row_ptr[u + 1u];
+                s_start_edge[sub_id] = start_e;
+                s_end_edge[sub_id] = end_e;
+                if ((end_e - start_e) >= hub_thresh) {
+                    atomicStore(&s_has_hub, 1u);
                 }
             }
         }
@@ -100,90 +185,48 @@ fn main(
     let cur_level = state.level;
 
     // Phase 1: Collaborative Hub Processing (Tier 1)
-    // When any vertex in the workgroup exceeds hub_thresh, ALL threads in the
-    // workgroup cooperatively iterate over outgoing edges with stride = WG_SIZE.
     if (atomicLoad(&s_has_hub) != 0u) {
         for (var s = 0u; s < NUM_SUB_WARPS; s = s + 1u) {
             let h_start = s_start_edge[s];
             let h_end = s_end_edge[s];
             let h_deg = h_end - h_start;
-            let h_f0 = s_f0[s];
-            let h_f1 = s_f1[s];
+            let h_mask = atomicLoad(&s_active_mask[s]);
 
-            if (h_deg >= hub_thresh && (h_f0 != 0u || h_f1 != 0u)) {
-                for (var edge = h_start + local_id.x; edge < h_end; edge = edge + WG_SIZE) {
-                    let v = col_ind[edge];
-                    let v_vis_idx0 = v * 2u;
-                    let v_vis_idx1 = v_vis_idx0 + 1u;
-
-                    var needed0: u32 = 0u;
-                    var needed1: u32 = 0u;
-
-                    if (h_f0 != 0u) {
-                        let vis0 = atomicLoad(&visited[v_vis_idx0]);
-                        needed0 = h_f0 & (~vis0);
-                    }
-                    if (h_f1 != 0u) {
-                        let vis1 = atomicLoad(&visited[v_vis_idx1]);
-                        needed1 = h_f1 & (~vis1);
-                    }
-
-                    if (needed0 == 0u && needed1 == 0u) {
-                        continue;
-                    }
-
-                    var newly0: u32 = 0u;
-                    var newly1: u32 = 0u;
-
-                    if (needed0 != 0u) {
-                        let prev0 = atomicOr(&visited[v_vis_idx0], needed0);
-                        newly0 = needed0 & (~prev0);
-                    }
-                    if (needed1 != 0u) {
-                        let prev1 = atomicOr(&visited[v_vis_idx1], needed1);
-                        newly1 = needed1 & (~prev1);
-                    }
-
-                    if (newly0 == 0u && newly1 == 0u) {
-                        continue;
-                    }
-
-                    let v_out_idx0 = out_frontier_base + v * 2u;
-                    let v_out_idx1 = v_out_idx0 + 1u;
-
-                    if (newly0 != 0u) {
-                        var bits = newly0;
-                        while (bits != 0u) {
-                            let bit_pos = countTrailingZeros(bits);
-                            let src = uniforms.chunk_start + bit_pos;
-                            distance[src * nv + v] = cur_level;
-                            bits = bits & (bits - 1u);
-                        }
-                        atomicOr(&frontiers[v_out_idx0], newly0);
-                    }
-
-                    if (newly1 != 0u) {
-                        var bits = newly1;
-                        while (bits != 0u) {
-                            let bit_pos = countTrailingZeros(bits);
-                            let src = uniforms.chunk_start + 32u + bit_pos;
-                            distance[src * nv + v] = cur_level;
-                            bits = bits & (bits - 1u);
-                        }
-                        atomicOr(&frontiers[v_out_idx1], newly1);
-                    }
-
-                    // Pre-check atomicLoad to mitigate exclusive lock contention on enqueued
-                    if (atomicLoad(&enqueued[v]) != cur_level) {
-                        if (atomicExchange(&enqueued[v], cur_level) != cur_level) {
-                            let local_slot = atomicAdd(&wg_queue_count, 1u);
-                            if (local_slot < WG_QUEUE_CAP) {
-                                wg_queue_items[local_slot] = v;
-                            } else {
-                                let slot = atomicAdd(&queue_sizes[out_slot], 1u);
-                                queues[out_queue_base + slot] = v;
+            if (h_deg >= hub_thresh && h_mask != 0u) {
+                if (h_deg >= ULTRA_HUB_THRESHOLD) {
+                    // Ultra-hub: 4x unrolled stride 256 traversal
+                    for (var edge_base = h_start; edge_base < h_end; edge_base = edge_base + 256u) {
+                        for (var k = 0u; k < 4u; k = k + 1u) {
+                            let edge = edge_base + k * WG_SIZE + local_id.x;
+                            if (edge < h_end) {
+                                process_neighbor(
+                                    col_ind[edge],
+                                    s,
+                                    h_mask,
+                                    nv,
+                                    cur_level,
+                                    out_frontier_base,
+                                    out_queue_base,
+                                    out_slot,
+                                    qid,
+                                );
                             }
                         }
+                    }
+                } else {
+                    // Standard hub: stride 64 traversal
+                    for (var edge = h_start + local_id.x; edge < h_end; edge = edge + WG_SIZE) {
+                        process_neighbor(
+                            col_ind[edge],
+                            s,
+                            h_mask,
+                            nv,
+                            cur_level,
+                            out_frontier_base,
+                            out_queue_base,
+                            out_slot,
+                            qid,
+                        );
                     }
                 }
             }
@@ -192,106 +235,56 @@ fn main(
     workgroupBarrier();
 
     // Phase 2: Independent Sub-Warp Processing for Low-Degree Vertices (Tier 2)
-    // Vertices with degree < hub_thresh are processed by their assigned sub-warps.
-    // Iterations are strictly bounded by ceil(hub_thresh / 4) <= 32-64.
     let my_start = s_start_edge[sub_id];
     let my_end = s_end_edge[sub_id];
     let my_deg = my_end - my_start;
-    let f0 = s_f0[sub_id];
-    let f1 = s_f1[sub_id];
+    let my_mask = atomicLoad(&s_active_mask[sub_id]);
 
-    if (my_deg < hub_thresh && (f0 != 0u || f1 != 0u)) {
+    if (my_deg < hub_thresh && my_mask != 0u) {
         for (var edge = my_start + sub_lane; edge < my_end; edge = edge + SUB_WARP_SIZE) {
-            let v = col_ind[edge];
-            let v_vis_idx0 = v * 2u;
-            let v_vis_idx1 = v_vis_idx0 + 1u;
-
-            var needed0: u32 = 0u;
-            var needed1: u32 = 0u;
-
-            if (f0 != 0u) {
-                let vis0 = atomicLoad(&visited[v_vis_idx0]);
-                needed0 = f0 & (~vis0);
-            }
-            if (f1 != 0u) {
-                let vis1 = atomicLoad(&visited[v_vis_idx1]);
-                needed1 = f1 & (~vis1);
-            }
-
-            if (needed0 == 0u && needed1 == 0u) {
-                continue;
-            }
-
-            var newly0: u32 = 0u;
-            var newly1: u32 = 0u;
-
-            if (needed0 != 0u) {
-                let prev0 = atomicOr(&visited[v_vis_idx0], needed0);
-                newly0 = needed0 & (~prev0);
-            }
-            if (needed1 != 0u) {
-                let prev1 = atomicOr(&visited[v_vis_idx1], needed1);
-                newly1 = needed1 & (~prev1);
-            }
-
-            if (newly0 == 0u && newly1 == 0u) {
-                continue;
-            }
-
-            let v_out_idx0 = out_frontier_base + v * 2u;
-            let v_out_idx1 = v_out_idx0 + 1u;
-
-            if (newly0 != 0u) {
-                var bits = newly0;
-                while (bits != 0u) {
-                    let bit_pos = countTrailingZeros(bits);
-                    let src = uniforms.chunk_start + bit_pos;
-                    distance[src * nv + v] = cur_level;
-                    bits = bits & (bits - 1u);
-                }
-                atomicOr(&frontiers[v_out_idx0], newly0);
-            }
-
-            if (newly1 != 0u) {
-                var bits = newly1;
-                while (bits != 0u) {
-                    let bit_pos = countTrailingZeros(bits);
-                    let src = uniforms.chunk_start + 32u + bit_pos;
-                    distance[src * nv + v] = cur_level;
-                    bits = bits & (bits - 1u);
-                }
-                atomicOr(&frontiers[v_out_idx1], newly1);
-            }
-
-            if (atomicLoad(&enqueued[v]) != cur_level) {
-                if (atomicExchange(&enqueued[v], cur_level) != cur_level) {
-                    let local_slot = atomicAdd(&wg_queue_count, 1u);
-                    if (local_slot < WG_QUEUE_CAP) {
-                        wg_queue_items[local_slot] = v;
-                    } else {
-                        let slot = atomicAdd(&queue_sizes[out_slot], 1u);
-                        queues[out_queue_base + slot] = v;
-                    }
-                }
-            }
+            process_neighbor(
+                col_ind[edge],
+                sub_id,
+                my_mask,
+                nv,
+                cur_level,
+                out_frontier_base,
+                out_queue_base,
+                out_slot,
+                qid,
+            );
         }
     }
-
     workgroupBarrier();
 
     // Phase 3: Workgroup Shared Queue Aggregation and Cooperative Global Flush
-    let total_wg_items = atomicLoad(&wg_queue_count);
-    let buffered_items = min(total_wg_items, WG_QUEUE_CAP);
-
-    if (local_id.x == 0u && buffered_items > 0u) {
-        wg_global_offset = atomicAdd(&queue_sizes[out_slot], buffered_items);
+    if (local_id.x == 0u) {
+        let c0 = min(atomicLoad(&s_sub_queue_count[0]), SUB_QUEUE_CAP);
+        let c1 = min(atomicLoad(&s_sub_queue_count[1]), SUB_QUEUE_CAP);
+        let c2 = min(atomicLoad(&s_sub_queue_count[2]), SUB_QUEUE_CAP);
+        let c3 = min(atomicLoad(&s_sub_queue_count[3]), SUB_QUEUE_CAP);
+        s_sub_counts[0] = c0;
+        s_sub_counts[1] = c1;
+        s_sub_counts[2] = c2;
+        s_sub_counts[3] = c3;
+        let total_buffered = c0 + c1 + c2 + c3;
+        var g_off = 0u;
+        if (total_buffered > 0u) {
+            g_off = atomicAdd(&queue_sizes[out_slot], total_buffered);
+        }
+        s_sub_offsets[0] = g_off;
+        s_sub_offsets[1] = g_off + c0;
+        s_sub_offsets[2] = g_off + c0 + c1;
+        s_sub_offsets[3] = g_off + c0 + c1 + c2;
     }
     workgroupBarrier();
 
-    if (buffered_items > 0u) {
-        let global_base = wg_global_offset;
-        for (var i = local_id.x; i < buffered_items; i = i + WG_SIZE) {
-            queues[out_queue_base + global_base + i] = wg_queue_items[i];
+    for (var q = 0u; q < 4u; q = q + 1u) {
+        let count = s_sub_counts[q];
+        let g_base = s_sub_offsets[q];
+        let q_base = q * SUB_QUEUE_CAP;
+        for (var i = local_id.x; i < count; i = i + WG_SIZE) {
+            queues[out_queue_base + g_base + i] = wg_queue_items[q_base + i];
         }
     }
 }

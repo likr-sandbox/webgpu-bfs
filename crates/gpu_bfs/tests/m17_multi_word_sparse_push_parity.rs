@@ -107,11 +107,11 @@ fn test_auto_routing_heuristic() {
     );
     assert_eq!(
         GpuBfsEngine::select_auto_method(&star, 32),
-        GpuBfsMethod::BitParallel64
+        GpuBfsMethod::IndirectSparseQueuePush
     );
     assert_eq!(
         GpuBfsEngine::select_auto_method(&star, 1),
-        GpuBfsMethod::SparseQueue
+        GpuBfsMethod::IndirectSparseQueuePush
     );
 
     // 3. Power-law R-MAT graph (hubs with max degree >= 128)

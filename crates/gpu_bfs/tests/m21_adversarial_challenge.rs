@@ -133,17 +133,17 @@ fn test_select_auto_method_adversarial_topologies() {
     // 1.5 Disjoint Cliques: Massive Hub (max_degree 199 >= 128)
     let hub_cliques = disconnected_cliques(&[10, 20, 200]);
     assert_eq!(hub_cliques.max_degree(), 199);
-    assert_eq!(GpuBfsEngine::select_auto_method(&hub_cliques, 1), GpuBfsMethod::SparseQueue);
-    assert_eq!(GpuBfsEngine::select_auto_method(&hub_cliques, 16), GpuBfsMethod::BitParallel64);
-    assert_eq!(GpuBfsEngine::select_auto_method(&hub_cliques, 32), GpuBfsMethod::BitParallel64);
+    assert_eq!(GpuBfsEngine::select_auto_method(&hub_cliques, 1), GpuBfsMethod::IndirectSparseQueuePush);
+    assert_eq!(GpuBfsEngine::select_auto_method(&hub_cliques, 16), GpuBfsMethod::IndirectSparseQueuePush);
+    assert_eq!(GpuBfsEngine::select_auto_method(&hub_cliques, 32), GpuBfsMethod::IndirectSparseQueuePush);
     assert_eq!(GpuBfsEngine::select_auto_method(&hub_cliques, 64), GpuBfsMethod::IndirectSparseQueuePush);
     assert_eq!(GpuBfsEngine::select_auto_method(&hub_cliques, 512), GpuBfsMethod::IndirectSparseQueuePush);
 
     // 1.6 Dense complete graph (K_250: max_degree 249 >= 128)
     let complete = clique_graph(250);
     assert_eq!(complete.max_degree(), 249);
-    assert_eq!(GpuBfsEngine::select_auto_method(&complete, 1), GpuBfsMethod::SparseQueue);
-    assert_eq!(GpuBfsEngine::select_auto_method(&complete, 32), GpuBfsMethod::BitParallel64);
+    assert_eq!(GpuBfsEngine::select_auto_method(&complete, 1), GpuBfsMethod::IndirectSparseQueuePush);
+    assert_eq!(GpuBfsEngine::select_auto_method(&complete, 32), GpuBfsMethod::IndirectSparseQueuePush);
     assert_eq!(GpuBfsEngine::select_auto_method(&complete, 64), GpuBfsMethod::IndirectSparseQueuePush);
 
     // 1.7 Dense Erdős-Rényi graph (V=200, p=0.8)
@@ -159,8 +159,8 @@ fn test_select_auto_method_adversarial_topologies() {
     assert_eq!(GpuBfsEngine::select_auto_method(&star_mid, 64), GpuBfsMethod::IndirectSparseQueuePush);
 
     let star_huge = star_graph(1000); // max_degree = 999
-    assert_eq!(GpuBfsEngine::select_auto_method(&star_huge, 1), GpuBfsMethod::SparseQueue);
-    assert_eq!(GpuBfsEngine::select_auto_method(&star_huge, 16), GpuBfsMethod::BitParallel64);
+    assert_eq!(GpuBfsEngine::select_auto_method(&star_huge, 1), GpuBfsMethod::IndirectSparseQueuePush);
+    assert_eq!(GpuBfsEngine::select_auto_method(&star_huge, 16), GpuBfsMethod::IndirectSparseQueuePush);
     assert_eq!(GpuBfsEngine::select_auto_method(&star_huge, 64), GpuBfsMethod::IndirectSparseQueuePush);
     assert_eq!(GpuBfsEngine::select_auto_method(&star_huge, 512), GpuBfsMethod::IndirectSparseQueuePush);
 
@@ -201,9 +201,9 @@ fn test_select_auto_method_exact_degree_boundaries() {
     assert_eq!(g127.max_degree(), 127);
     assert_eq!(g128.max_degree(), 128);
 
-    // S = 16: 127 routes to BitParallel32, 128 routes to BitParallel64
+    // S = 16: 127 routes to BitParallel32, 128 routes to IndirectSparseQueuePush
     assert_eq!(GpuBfsEngine::select_auto_method(&g127, 16), GpuBfsMethod::BitParallel32);
-    assert_eq!(GpuBfsEngine::select_auto_method(&g128, 16), GpuBfsMethod::BitParallel64);
+    assert_eq!(GpuBfsEngine::select_auto_method(&g128, 16), GpuBfsMethod::IndirectSparseQueuePush);
 
     // S = 64: both route to IndirectSparseQueuePush
     assert_eq!(GpuBfsEngine::select_auto_method(&g127, 64), GpuBfsMethod::IndirectSparseQueuePush);

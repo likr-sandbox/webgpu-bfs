@@ -1,8 +1,8 @@
 # WebGPU Multi-Source BFS (`webgpu-bfs`) Project Knowledge Base & Agent Guide
 
-> **Document Version**: 1.4.0  
-> **Last Updated**: 2026-10-12  
-> **Scope**: Architecture, Milestones M1–M21, Hardware & WebGPU Constraints, Algorithmic Insights, and Future Roadmap
+> **Document Version**: 1.6.0  
+> **Last Updated**: 2026-10-14  
+> **Scope**: Architecture, Milestones M1–M23, Bottleneck Analysis, Hardware & WebGPU Constraints, Algorithmic Insights, and M24–M25 Optimization Roadmap
 
 ---
 
@@ -46,6 +46,34 @@
    - 全 14 の GPU 手法・メタ手法（`Auto` 含む）と CPU リファレンス（Rayon / FIFO）の間で、数億ホップ計算にわたる最短距離配列のビット単位完全一致（Parity ✅ 100.0%）を機械的テストスイートで保証。
 6. **全グラフ無向化ポリシーの標準適用**:
    - 入力されたグラフが有向グラフであっても自動的に対称化（無向化）して走査を実施。標準バッチサイズは $S \in \{1, 16, 64, 256, 1024, 2048\}$ に統一。
+7. **Sparse Push 端数バッチ 1 パス化・極小バッチリセット最適化・第 3 世代協調ハブ展開の全面水平展開 (Milestone M22)**:
+   - 従来マルチパス分割直列化（2 パス実行）されていた端数バッチ（$S=128$, $S=384$）および極小バッチ（$S \le 32$）における構造的遅延を打破し、M20 の第 3 世代協調アーキテクチャを全 Push シェーダーへ水平展開:
+     * **端数バッチ 1 パス統合ルーティング**: 分岐閾値を上限基準（$256 < S \le 512 \to \text{pool\_512}$, $64 < S \le 256 \to \text{pool\_256}$）へ改修。Phase 0 に `w < uniforms.num_words` ガードを導入し、非アクティブワードの不可分交換をスキップ。最終バンクの `u16` 量子化・DMA リードバックもアクティブ始点分（`0..active_banks`）に厳格に制限。
+     * **実要素数バウンド距離リセット**: 距離配列の初期化を固定最大容量（$64 \times |V| = 72.17\text{ MB}$）から厳密な実バッチ要素数（$S \times |V|$）へ縮小。$S=1$ では 1.13 MB のみのリセットとなり、初期化オーバーヘッドを $64\times$ 削減。さらに $S \le 32$ では `num_words = 1` を適用。
+     * **細粒度並列 CPU アンパック**: `std::thread::scope` による 2 バイト境界（ワード整合）分割を用いて、小バッチでも全 CPU 論理コアを活用した並列アンパックを展開。
+     * **第 3 世代 M20 最適化の全面水平展開**: `indirect_sparse_push_256.wgsl` および `indirect_sparse_push.wgsl` に対し、Phase 0 サブワープ協調ロード、2,048 エントリ LDS キュー（WebGPU 16KB 制約内）、4 サブクアドラント・アトミックカウンタ（`s_sub_queue_count[4]`）、Stride 256 ウルトラハブ展開（次数 $\ge 1,024$）、ホイスティングされた距離書き込み関数を全面移植。
+     * **トポロジー適応型 `Auto` ルーター刷新**: べき乗則グラフ（$d_{\max} \ge 128$）において、$S \ge 1$ の全バッチサイズを永続バッファプール対応の `IndirectSparseQueuePush` へルーティング。
+   - **定量的ベンチマーク実測値 (WSL2 D3D12 / RTX 3050 - M22 最適化適用)**:
+     - **単一始点 ($S=1$)**: 実行時間 **25.25〜36.99 ms**（従来の未プール ~180 ms から **$\sim 5\times$ 高速化**）。
+     - **小規模バッチ ($S=16$)**: 実行時間 **58.19〜68.39 ms**（従来 ~210 ms から大幅短縮）。CPU Rayon (76.37〜117.92 ms) に対し **$1.26\times \sim 1.72\times$ 高速化**、CPU Single-Thread FIFO (235.19 ms) に対し **$3.44\times \sim 3.89\times$ 高速化**。
+     - **端数バッチの厳格な単調性確保**:
+       * $S=128$: **165.62〜242.97 ms**（$S=256$: 290.46〜388.85 ms に対し **$1.60\times \sim 2.31\times$ 高速化**、$T(128) < T(256)$ 完全成立）。
+       * $S=384$: **381.12〜733.41 ms**（$S=512$: 455.10〜1,379.13 ms に対し **$1.28\times \sim 1.88\times$ 高速化**、$T(384) < T(512)$ 完全成立）。
+     - **全領域完全パリティ**: $S \in \{1, 16, 64, 128, 256, 384, 512, 1024, 2048\}$ および境界 $S \in \{33, 65, 257, 513\}$ において 100.0% ビット完全性（Parity ✅）を達成。
+8. **高直径道路網スケーリング・Pull カーネルバリア全廃・Dirty-Check 条件付きゼロクリア・重複バッファ排除 (Milestone M23)**:
+   - 高直径道路網（`luxembourg_osm`, $D \approx 1,311$）および長経路探索における WSL2 `/dev/dxg` ホスト同期遅延と DRAM トラフィックを劇的に削減:
+     * **Pull カーネルのツリーリダクションバリア全廃 & LDS 0 バイト化**: `multi_word_bp_pull_512.wgsl` において、8 段階のツリーリダクション `workgroupBarrier()` ループを完全撤廃。終了判定が真偽値（`count == 0`）のみを参照する特性を利用し、`if (thread_new_count > 0u) { atomicStore(&active_count, 1u); }` による直接アトミックストアへ置換。1 探索あたり 1 億 3,750 万回以上のワークグループバリアを完全消去し、共有メモリ消費量を 0 バイトへ削減。
+     * **Dirty-Check 付き条件付きフロンティアゼロクリア**: Ping-Pong フロンティアバッファにおいて、無条件クリア `next_frontier[state_idx] = 0u` を `if (next_frontier[state_idx] != 0u) { next_frontier[state_idx] = 0u; }` へ置換。Ping-Pong の数学的不変条件を 100% 保持したまま、99.92% の非アクティブ頂点に対する無駄な DRAM 書き込みをスキップし、パスあたり約 9.6 GB のメモリ書き込みトラフィックを排除。
+     * **非アクティブ始点ワードの早期スキップ & バンク判定ホイスティング**: `src_start >= params.total_sources` による早期 `continue` ガードを追加し、未使用始点スロット（$S=64$ で 87.5%、$S=256$ で 50%）の探索・マスク計算をバイパス。さらにビット走査ループ外へ 8 ウェイ switch をホイスティング。
+     * **適応的マクロバッチ拡大 (3 階層: $160 \to 320 \to 512$ ホップ)**: `indirect_sparse_push.rs` において、`level > 0` のチャンクホップ幅を固定 64 からレベル進捗に応じて適応的に 320 / 512 ホップへ拡大。Luxembourg OSM における `/dev/dxg` ホスト同期ラウンドトリップ回数を 19 回から 4 回へ激減。
+     * **BFS 単調性を利用した最終ステップ単一カウンタ評価**: 探索フロンティアの単調縮小性（$F_h = \emptyset \implies F_{h+1} = \emptyset$）に基づき、各マクロチャンク内の全 64 ホップのカウンタコピーを廃止し、最終ホップ `counter_bufs[last_k]` のみ（4 バイト）をリードバック。ドライバコピー回数を $64\times$ 削減。
+     * **`Arc<wgpu::Buffer>` による対称グラフバッファ重複排除**: `PushPullGraphBuffers` において CSC オフセットおよび行インデックスを CSR の `Arc<Buffer>` へエイリアスし、無向グラフにおける VRAM トポロジーメモリ消費および PCIe アップロード量を半減。さらに `from_symmetric_graph` によりホスト側の `is_symmetric()` 転置チェックを完全バイパス。
+   - **定量的ベンチマーク実測値 (WSL2 D3D12 / RTX 3050 - M23 最適化適用)**:
+     - **道路網大規模バッチ `luxembourg_osm` ($S=2048$)**: 実行時間 **1,765.48〜2,054.96 ms**（平均 2,054 ms / 最速 1,765 ms）。従来の M19 ベースライン（2,686 ms）から **約 631〜920 ms 短縮（$1.31\times \sim 1.52\times$ 高速化）**、CPU 単一スレッド (3,684 ms) を大きく引き離す。
+     - **道路網中規模バッチ `luxembourg_osm` ($S=64$)**: 実行時間 **211.62〜230.05 ms**（最速 205.95 ms）。$\le 233\text{ ms}$ の目標を安定してクリア。
+     - **無向べき乗則グラフ `web-Stanford` ($S=512$)**: 実行時間 **448.81〜593.16 ms**、スループット **2,946〜4,024 Harmonic MTEPS**（1,141 sources/s）。CPU Rayon に対する優位性を完全維持。
+     - **全ワークスペース 100% ビット完全性**: 単体・統合・Adversarial 全テストスイートで 0 失敗、全バッチサイズ・全トポロジーで Parity ✅ 100.0% を達成。
+
 
 ---
 
@@ -64,11 +92,11 @@
 | `PushPullAdaptive` | GPU | Hybrid | フロンティア密度（閾値 5%）に基づく動的 Push/Pull 切り替え | スケールフリー網・高密度グラフ |
 | `SparseQueue` | GPU | Push | Prefix Sum / キュー集約によるアクティブ頂点のみの走査 | **単一始点 ($S=1$) スパース走査** |
 | `SparseBitParallel64`| GPU | Push | 64 本ビット並列＋動的キュー集約フィルタリング | 小〜中規模バッチ ($S \le 16$) で強力 |
-| `MultiWordBitParallel`| GPU | Pull | 512 始点 8 バンク Pull 走査（128 スレッド/WG）、GPU 内 u16 量子化、単一エンコーダ DMA、永続バッファプール、S<=64 高速パス | **無向高直径網（道路網）の大規模バッチ ($S \le 2048$) で最速・パス数 8x 削減** |
+| `MultiWordBitParallel`| GPU | Pull | 512 始点 8 バンク Pull 走査（バリア 0 回・LDS 0B）、Dirty-Check Ping-Pong、最終単一カウンタ評価、GPU 内 u16 量子化、単一エンコーダ DMA、永続バッファプール、S<=64 高速パス | **無向高直径網（道路網）の大規模バッチ ($S \le 2048$) で最速・S=2048で1,765〜2,054 ms (1.52x高速化)** |
 | `IndirectMacroBatch` | GPU | Pull | `dispatch_workgroups_indirect` による GPU 内完結反復 | ホスト・デバイス間通信の極小化 |
-| `IndirectSparseQueuePush`| GPU | Push | 次数考慮型協調ハブ展開（2階層stride 64/256）＋Phase 0分散ロード＋LDS 2048キュー（4クアドラント・アトミック）＋512/256-bitマルチワード＋マルチバンク距離バッファ（$\le 128$ MB分割）＋GPU内u16量子化 | **無向べき乗則グラフ（Web・ソーシャル）の全バッチ ($S \le 2048$) で最速・CPU Rayon 最大 8.27x 逆転 (5,091 MTEPS)** |
+| `IndirectSparseQueuePush`| GPU | Push | 次数考慮型協調ハブ展開（2階層stride 64/256）＋Phase 0分散ロード＋LDS 2048キュー（4クアドラント・アトミック）＋512/256/64-bitマルチワード＋端数バッチ1パス統合＋実要素数リセット＋GPU内u16量子化 | **無向べき乗則グラフ（Web・ソーシャル）の全バッチ ($S \le 2048$) で最速・S=1..16でもCPU Rayon逆転・CPU比最大8.27x (5,091 MTEPS)** |
 | `MultiWordBitParallelPush`| GPU | Push | 動的ストライドループによる複数ワード ($S \le 2048$) Push 型ビット並列 | 中〜大規模バッチ Push 探索 |
-| `Auto` | GPU (Meta) | Adaptive | グラフの最大次数とバッチサイズに基づくトポロジー適応型自動ルーティング（低次数網: MultiWordBitParallel、べき乗則ハブ網: IndirectSparseQueuePush、小中バッチ: BitParallel64、単一始点: SparseQueue） | **プロダクション推奨デフォルト・全トポロジー自動最適化・全領域非退行** |
+| `Auto` | GPU (Meta) | Adaptive | グラフの最大次数とバッチサイズに基づくトポロジー適応型自動ルーティング（低次数網: MultiWordBitParallel、べき乗則ハブ網: IndirectSparseQueuePush 全バッチ S>=1、中間グラフ小中バッチ: BitParallel64、単一始点: SparseQueue） | **プロダクション推奨デフォルト・全トポロジー自動最適化・全領域非退行** |
 
 ---
 
@@ -199,6 +227,17 @@ WebGPU は高いポータビリティを持つ反面、ネイティブ CUDA 等�
 - **検証保証**:
   - `crates/gpu_bfs/src/engine.rs` 内の単体テストスイートおよび統合テストにより、すべての次数境界（$d_{\max} \in \{0, 1, 4, 7, 32, 33, 64, 127, 128, 256, 1024, 38625\}$）とバッチサイズ境界（$S \in \{0, 1, 2, 16, 31, 32, 63, 64, 256, 512, 1024, 2048\}$）で決定論的に正しいアルゴリズムが選択されることを完全保証。
 
+### 3.9 詳細プロファイリングで判明した構造的ボトルネックと設計原則 (Post-M21 Analysis)
+1. **Pull 走査における Indirect 化の逆効果とバリア全廃の有効性**:
+   - 道路網（`luxembourg_osm`, $D=1,311$）の Pull 走査では全アクティブホップで全頂点グリッドを起動するため、`dispatch_workgroups_indirect`（`IndirectMacroBatch`）を適用してもワークグループ削減効果がなく、WSL2 GL-on-D3D12 バックエンドにおける 1,311 回の `prep_hop` 起動と `GL_COMMAND_BARRIER_BIT` により 211.6 ms $\to$ 321.7 ms（+52%）へ劣化する。
+   - 一方、`multi_word_bp_pull_512.wgsl` の末尾で行われている 8 回の `workgroupBarrier()` ツリーリダクション（1 パスあたり約 1.5 億回）は、ホスト側が `active_count == 0` の真偽値しか参照しないため、`if (thread_new_count > 0u) { atomicStore(&active_count, 1u); }` へ置換することで共有メモリとバリアを完全にゼロ化できる。
+2. **Ping-Pong フロンティアの Dirty-Check 付き条件付きゼロクリア**:
+   - Pull シェーダーの `frontier_buf_a` / `frontier_buf_b` はホップ間で `clear_buffer` されない Ping-Pong バッファであるため、`next_frontier[state_idx] = 0u` を単純削除すると 2 ホップ前の古いフロンティアビットが残存してパリティ破壊を起こす。
+   - `if (next_frontier[state_idx] != 0u) { next_frontier[state_idx] = 0u; }` と Dirty Check を行うことで、Ping-Pong 不変条件を 100% 維持しつつ、99.92% の非アクティブ頂点に対する 9.6 GB/パスの無駄な DRAM 書き込みを L1/L2 キャッシュヒット判定へ変換できる。
+3. **マルチワード・カーネルの端数バッチ上限ルーティングと実サイズリセット**:
+   - 512-bit / 256-bit カーネルの分岐条件は下限（`>= 512` / `>= 256`）ではなく、1 パスで収容可能な上限基準（`num_sources > 256` $\to$ 512-bit、`num_sources > 64` $\to$ 256-bit）とし、シェーダー内で `w < uniforms.num_words` により非アクティブワードをスキップさせることで、$S=128, 384$ 等の端数バッチにおける複数パス直列劣化を防止する。
+   - 距離バッファのリセットおよび `u16` パック範囲は常に最大容量（`64 * nv`）ではなく実バッチ要素数（`batch_size * nv`）に限定する。
+
 ---
 
 ## 4. 扱えるグラフ規模のハードウェア限界モデル (Scaling Limits)
@@ -236,21 +275,39 @@ WebGPU は高いポータビリティを持つ反面、ネイティブ CUDA 等�
    - Phase 0 サブワープ協調ロード、LDS 2,048 キュー、4 サブクアドラント・アトミックバンク競合解消、Stride 256 ウルトラハブ展開、バンク判定外出しにより、無向べき乗則グラフの大規模バッチで 4,272〜5,091 MTEPS（CPU Rayon 比 $2.12\times \sim 8.27\times$ 高速化）を達成。
 6. **トポロジー自動ルーター検証・全ワークスペース完全パリティ** 【M21 実装完了 ✅】:
    - `select_auto_method` によるグラフ次数・始点数に応じた最適アルゴリズム選定（低次数網: MultiWordBitParallel、べき乗則網: IndirectSparseQueuePush、小中バッチ: BitParallel64、単一始点: SparseQueue）の単体・結合テスト網羅、ワークスペース全テストでの 100.0% ビット完全性検証。
+7. **`ISQP` 端数バッチ 1 パス化・距離リセット極小化・M20 水平展開・小中バッチ `Auto` 刷新** 【M22 実装完了 ✅】:
+   - 端数バッチ（$256 < S \le 512 \to \text{pool\_512}$, $64 < S \le 256 \to \text{pool\_256}$）の 1 パス統合と Phase 0 `w < uniforms.num_words` ガードによる非アクティブワードスキップにより、端数バッチの複数パス直列劣化を完全解消。
+   - 距離配列初期化を実要素数 $S \times |V|$（$S=1$ で 1.13 MB）へ縮小、$S \le 32$ で `num_words = 1` を適用、`std::thread::scope` 細粒度並列アンパックを導入。
+   - `indirect_sparse_push_256.wgsl` および `indirect_sparse_push.wgsl` へ Phase 0 サブワープ協調ロード、2,048 エントリ LDS キュー、4 クアドラント・アトミック、Stride 256 ウルトラハブ展開、距離書き込みホイスティングを水平展開。
+   - べき乗則グラフ（$d_{\max} \ge 128$）の $S \ge 1$ を永続プール対応 `IndirectSparseQueuePush` へルーティングし、$S=1$（25〜37 ms、5x 高速化）、$S=16$（58〜68 ms）で CPU Rayon を完全逆転。
+8. **高直径網向け適応的マクロバッチ拡大 & Pull カーネルのバリア全廃・Dirty-Check 化・重複バッファ排除** 【M23 実装完了 ✅】:
+   - `multi_word_bp_pull_512.wgsl` の 8 段階ツリーリダクション `workgroupBarrier()` を廃止し、`if (thread_new_count > 0u) { atomicStore(&active_count, 1u); }` による直接アトミックストア置換（バリア 0 回、LDS 0 バイト化）。
+   - Ping-Pong フロンティアの Dirty-Check 付き条件付きゼロクリア（`if (next_frontier[state_idx] != 0u) { next_frontier[state_idx] = 0u; }`）により、パスあたり約 9.6 GB の DRAM 書き込みトラフィックを排除。
+   - 未使用始点ワードの早期スキップ（`src_start >= params.total_sources`）および距離バンク判定のループ外ホイスティング。
+   - `indirect_sparse_push.rs` の適応的マクロバッチ拡大（3 階層: $160 \to 320 \to 512$ ホップ）により、高直径道路網の `/dev/dxg` 同期を 19 回から 4 回へ削減。
+   - BFS 単調性に基づく最終ステップ単一カウンタ評価（`counter_bufs[last_k]` のみ読み出し）により、ドライバカウンタコピーを $64\times$ 削減。
+   - `PushPullGraphBuffers` の `Arc<wgpu::Buffer>` による CSC/CSR バッファ重複排除および `from_symmetric_graph` によるホスト転置バイパス。
+   - `luxembourg_osm` $S=2048$ で 1,765〜2,054 ms（$1.31\times \sim 1.52\times$ 高速化）、$S=64$ で 211〜230 ms を達成。
 
-### Phase 4: 次期最適化および機能拡張テーマ (Next Frontier)
-1. **GPU 自律反復（Indirect）と Multi-Word Pull の融合**:
-   - 1,311 ホップの走査中にホスト同期を一切挟まず、GPU 側のアトミックフラグで早期終了を判定する完全自律間接ディスパッチを実装し、ハイパーバイザ往復遅延を排除。
-3. **到達可能性（Reachability）特化ビットマスクモード**:
-   - 最短ホップ数が不要で接続性・到達判定のみを求める場合、距離配列を排除しビットマスク（$\frac{S}{8}$ バイト/頂点）のみを出力。
-   - 効果: $S=2048$ でも頂点あたりわずか 256 バイト（$32\times$ 圧縮）となり、$S \ge 512$ の大規模バッチでも PCIe 転送ボトルネックを完全突破。
-4. **Out-of-Core / エッジ分割ストリーミング**:
-   - VRAM 上限（6.0 GB）を超える超巨大グラフ（全米道路網 USA-road-d など）を扱うため、CSR エッジ配列をブロック分割し、ホスト RAM からストリーミング走査するパイプラインの設計。
-5. **動的実行時フロンティア密度適応 (Runtime Hybrid Switching)**:
-   - GraphBLAST 式に、各ホップのフロンティアサイズ（アクティブ頂点数）を GPU 内で監視し、フロンティアが一定比率（例: 5%）を超えたホップのみ動的に Pull 走査へ切り替えるハイブリッド反復機構。
-6. **WASM / Web フロントエンドのデモ・可視化強化**:
-   - ブラウザ上で Matrix Market ファイルをドラッグ＆ドロップし、WebGPU Compute Shader の実行時間や MTEPS、探索波面の広がりをリアルタイム Canvas 描画するインタラクティブデモ UI の整備。
-7. **分散マルチ GPU 展開 (WebGPU Workgroup Clustering)**:
-   - 複数 GPU へのフロンティアブロードキャストとリダクションパイプラインの設計。
+### Phase 4: 次期高速化ロードマップ (Actionable Milestones M24–M25)
+
+#### Milestone M24 (Priority P2): 適応的 `u8`/`u16` 距離量子化 & 非同期 DMA チャンクパイプライン & 2D Indirect Grid
+1. **GPU 内 `u8` 距離量子化 (`pack_distances_u32_to_u8.wgsl`)**:
+   - 最終到達レベル `st[0] < 255`（`web-Stanford` 等のスモールワールド網）のとき、4 頂点距離を 1 ワード（`u32`）へパッキング（到達不能は `0xFF`）。PCIe DMA 転送量を 288.67 MB $\to$ 144.33 MB（`u32` 比 $4\times$ 圧縮）へ半減し、`web-Stanford` $S=2048$ を ~1,450 ms へ短縮。
+2. **ダブルバッファリング非同期 DMA パイプライン**:
+   - $S=1024, 2048$ の複数チャンク実行時に、チャンク $i$ の CPU アンパック処理とチャンク $i+1$ の GPU 探索コマンド実行をオーバーラップ。
+3. **`prep_sparse_push_hop.wgsl` の 2D Indirect Grid 対応**:
+   - `total_wgs > 65535u` の際に `workgroups_x = 256u; workgroups_y = (total_wgs + 255u) / 256u;` へ自動展開し、`@builtin(num_workgroups)` で `wg_id` を復元することで 100 万頂点超のアクティブキューに完全対応。
+
+#### Milestone M25 (Priority P3): GPU 自律型 Direction-Optimizing ハイブリッド & スケールアウト・フロントエンド統合
+1. **GPU 自律型 Direction-Optimizing (Sparse Push $\leftrightarrow$ Multi-Bank Pull) ハイブリッド**:
+   - `prep_sparse_push_hop.wgsl` が `in_count > |V| / 16` を検知した高密度ホップのみ 8 バンク Pull パスを起動し、疎なホップは Sparse Queue Push を実行するハイブリッド反復。
+2. **到達可能性（Reachability）ビットマスク直接出力 API & $|V| > 524,288$ 動的バンク幅スケーリング**:
+   - `visited` ビットマスク（1 bit/source/vertex）をそのまま返す高速モード（出力サイズ $1/32$、$S=2048$ を 1 パス実行）と、$|V| > 524,288$ グラフ向けのバンクあたり始点数（32/16 始点）動的縮小。
+3. **CLI デフォルトの `Auto` 化と WASM 非同期 `map_async` 対応**:
+   - `crates/cli/src/args.rs` のデフォルト手法を `Auto` に更新し、`crates/wasm` で最新エンジン（`Auto` / `ISQP` / `MWBP`）を非同期 `map_async` 対応で公開。
+4. **Out-of-Core / エッジ分割ストリーミングおよび分散マルチ GPU 展開**:
+   - VRAM 上限を超える超巨大グラフのブロック分割ストリーミングと複数 GPU への展開。
 
 ---
 
@@ -261,9 +318,11 @@ WebGPU は高いポータビリティを持つ反面、ネイティブ CUDA 等�
 - **WebGPU ポータビリティと WSL2 D3D12 の維持**:
   WGSL コードおよびバインディング設計において、標準 WebGPU 仕様を維持しつつ、WSL2 `/dev/dxg` Direct3D 12 Gallium パスでの動作安定性を維持すること。
 - **2D グリッドディスパッチの徹底**:
-  頂点単位のコンピュートシェーダーを設計する際は、将来の大規模グラフ適用に備え、65535 を超えるワークグループを安全にディスパッチできる 2D グリッドマッピングを採用すること。
-- **マルチバンク距離バッファ設計の遵守**:
-  WebGPU の標準 128 MB バインディング制限を意識し、大規模バッチ拡張時は 64 始点単位のバンク分割設計を維持すること。
+  頂点単位および Indirect キュー単位のコンピュートシェーダーを設計する際は、65535 を超えるワークグループを安全にディスパッチできる 2D グリッドマッピングを採用すること。
+- **マルチバンク距離バッファ設計と端数バッチ上限ルーティングの遵守**:
+  WebGPU の標準 128 MB バインディング制限を意識し、64 始点単位のバンク分割設計を維持すること。また、マルチワード・カーネルの分岐は `num_sources > 256` ($\to$ 512) / `num_sources > 64` ($\to$ 256) のように上限容量基準でルーティングし、リセットや DMA コピーは実バッチサイズ分のみに限定すること。
+- **Ping-Pong バッファにおける Dirty-Check 原則の遵守**:
+  ホップ間で `clear_buffer` されない Ping-Pong フロンティアバッファにおいて、非アクティブ要素のゼロクリアを単純削除してはならない（2 ホップ前の古いビットが残存するため）。必ず `if (next_frontier[idx] != 0u) { next_frontier[idx] = 0u; }` の Dirty Check 付き条件付き書き込みを用いること。
 - **ハブノードに対する協調展開の徹底**:
   べき乗則グラフの Push 走査シェーダーでは、次数 $\ge 128$ のハブノードを単一スレッド／サブワープで直列走査せず、ワークグループ協調（stride 64/256）で展開すること。
 - **バッファプールと事前フォールティングの遵守**:

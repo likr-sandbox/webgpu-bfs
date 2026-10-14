@@ -1,10 +1,14 @@
 // crates/shaders/src/multi_word_bp_pull_512.wgsl
 // Multi-Word Bit-Parallel Pull Traversal Kernel for 512 sources (16 words per vertex)
 // Milestone M19: 8 Multi-Bank Distance Storage Buffers & Zero-Atomic Direct Writing
+// Milestone M23 Optimizations:
+// 1. Elimination of 8 tree-reduction workgroupBarrier() calls via direct atomicStore(&active_count, 1u)
+// 2. Early continue for inactive sources (src_start >= params.total_sources)
+// 3. Dirty-Check conditional zero-clearing on Ping-Pong next_frontier
+// 4. Distance bank write hoisting (loop-external switch dispatch)
 
 const W_k: u32 = 16u;
 const W_v: u32 = 8u;
-const WG_SIZE: u32 = 128u;
 
 struct Params {
     num_vertices: u32,
@@ -35,18 +39,66 @@ struct Params {
 @group(0) @binding(13) var<storage, read_write> dist_bank6: array<u32>;
 @group(0) @binding(14) var<storage, read_write> dist_bank7: array<u32>;
 
-var<workgroup> local_counts: array<u32, WG_SIZE>;
-
-fn write_distance_bank(bank: u32, idx: u32, level: u32) {
+fn write_bank_bits(bank: u32, k: u32, mut_bits: u32, v: u32, nv: u32, cur_level: u32) {
+    let w_offset = (k & 1u) * 32u;
+    var bits = mut_bits;
     switch (bank) {
-        case 0u: { dist_bank0[idx] = level; }
-        case 1u: { dist_bank1[idx] = level; }
-        case 2u: { dist_bank2[idx] = level; }
-        case 3u: { dist_bank3[idx] = level; }
-        case 4u: { dist_bank4[idx] = level; }
-        case 5u: { dist_bank5[idx] = level; }
-        case 6u: { dist_bank6[idx] = level; }
-        case 7u: { dist_bank7[idx] = level; }
+        case 0u: {
+            while (bits != 0u) {
+                let bit_pos = countTrailingZeros(bits);
+                dist_bank0[(w_offset + bit_pos) * nv + v] = cur_level;
+                bits = bits & (bits - 1u);
+            }
+        }
+        case 1u: {
+            while (bits != 0u) {
+                let bit_pos = countTrailingZeros(bits);
+                dist_bank1[(w_offset + bit_pos) * nv + v] = cur_level;
+                bits = bits & (bits - 1u);
+            }
+        }
+        case 2u: {
+            while (bits != 0u) {
+                let bit_pos = countTrailingZeros(bits);
+                dist_bank2[(w_offset + bit_pos) * nv + v] = cur_level;
+                bits = bits & (bits - 1u);
+            }
+        }
+        case 3u: {
+            while (bits != 0u) {
+                let bit_pos = countTrailingZeros(bits);
+                dist_bank3[(w_offset + bit_pos) * nv + v] = cur_level;
+                bits = bits & (bits - 1u);
+            }
+        }
+        case 4u: {
+            while (bits != 0u) {
+                let bit_pos = countTrailingZeros(bits);
+                dist_bank4[(w_offset + bit_pos) * nv + v] = cur_level;
+                bits = bits & (bits - 1u);
+            }
+        }
+        case 5u: {
+            while (bits != 0u) {
+                let bit_pos = countTrailingZeros(bits);
+                dist_bank5[(w_offset + bit_pos) * nv + v] = cur_level;
+                bits = bits & (bits - 1u);
+            }
+        }
+        case 6u: {
+            while (bits != 0u) {
+                let bit_pos = countTrailingZeros(bits);
+                dist_bank6[(w_offset + bit_pos) * nv + v] = cur_level;
+                bits = bits & (bits - 1u);
+            }
+        }
+        case 7u: {
+            while (bits != 0u) {
+                let bit_pos = countTrailingZeros(bits);
+                dist_bank7[(w_offset + bit_pos) * nv + v] = cur_level;
+                bits = bits & (bits - 1u);
+            }
+        }
         default: {}
     }
 }
@@ -54,8 +106,7 @@ fn write_distance_bank(bank: u32, idx: u32, level: u32) {
 @compute @workgroup_size(W_k, W_v, 1)
 fn main(
     @builtin(workgroup_id) group_id: vec3<u32>,
-    @builtin(local_invocation_id) local_id: vec3<u32>,
-    @builtin(local_invocation_index) local_index: u32
+    @builtin(local_invocation_id) local_id: vec3<u32>
 ) {
     let wg_id = group_id.x + group_id.y * params.dispatch_x;
     let v = wg_id * W_v + local_id.y;
@@ -67,24 +118,26 @@ fn main(
         let end_edge = row_ptr[v + 1u];
 
         for (var k = local_id.x; k < params.words_per_vertex; k = k + W_k) {
+            let src_start = k * 32u;
+            if (src_start >= params.total_sources) {
+                continue;
+            }
+
             let state_idx = v_base + k;
             let vis = visited[state_idx];
 
-            var word_mask: u32 = 0u;
-            let src_start = k * 32u;
-            if (src_start < params.total_sources) {
-                let rem = params.total_sources - src_start;
-                if (rem >= 32u) {
-                    word_mask = 0xFFFFFFFFu;
-                } else {
-                    word_mask = (1u << rem) - 1u;
-                }
+            var word_mask: u32 = 0xFFFFFFFFu;
+            let rem = params.total_sources - src_start;
+            if (rem < 32u) {
+                word_mask = (1u << rem) - 1u;
             }
 
             let needed = (~vis) & word_mask;
 
             if (needed == 0u) {
-                next_frontier[state_idx] = 0u;
+                if (next_frontier[state_idx] != 0u) {
+                    next_frontier[state_idx] = 0u;
+                }
             } else {
                 var cand: u32 = 0u;
 
@@ -104,36 +157,19 @@ fn main(
                     visited[state_idx] = vis | newly;
                     next_frontier[state_idx] = newly;
 
-                    var bits = newly;
-                    let bank = k >> 1u;
-                    let word_in_bank = k & 1u;
-                    while (bits != 0u) {
-                        let bit_pos = countTrailingZeros(bits);
-                        let local_s = word_in_bank * 32u + bit_pos;
-                        let dist_idx = local_s * params.num_vertices + v;
-                        write_distance_bank(bank, dist_idx, params.current_level + 1u);
-                        bits = bits & (bits - 1u);
-                    }
+                    write_bank_bits(k >> 1u, k, newly, v, params.num_vertices, params.current_level + 1u);
 
                     thread_new_count = thread_new_count + countOneBits(newly);
                 } else {
-                    next_frontier[state_idx] = 0u;
+                    if (next_frontier[state_idx] != 0u) {
+                        next_frontier[state_idx] = 0u;
+                    }
                 }
             }
         }
     }
 
-    local_counts[local_index] = thread_new_count;
-    workgroupBarrier();
-
-    for (var stride: u32 = WG_SIZE >> 1u; stride > 0u; stride = stride >> 1u) {
-        if (local_index < stride) {
-            local_counts[local_index] = local_counts[local_index] + local_counts[local_index + stride];
-        }
-        workgroupBarrier();
-    }
-
-    if (local_index == 0u && local_counts[0] > 0u) {
-        atomicAdd(&active_count, local_counts[0]);
+    if (thread_new_count > 0u) {
+        atomicStore(&active_count, 1u);
     }
 }

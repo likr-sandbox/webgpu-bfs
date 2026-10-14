@@ -247,17 +247,11 @@ pub fn run_bit_parallel_64_pull(
         queue.write_buffer(&distance_buf, 0, bytemuck::cast_slice(&init_distance));
 
         let mut level = 0u32;
-        let mut total_sub = std::time::Duration::ZERO;
-        let mut total_read = std::time::Duration::ZERO;
-        let mut total_write_buf = std::time::Duration::ZERO;
-        let mut total_pass_rec = std::time::Duration::ZERO;
-        let t_loop_start = std::time::Instant::now();
         let mut cur_chunk_steps = 1usize;
 
         while level <= nv {
             let chunk_len = cur_chunk_steps.min(CHUNK_STEPS).min((nv - level + 1) as usize);
 
-            let t_wb = std::time::Instant::now();
             for k in 0..chunk_len {
                 let p = Pull64Params {
                     num_vertices: nv,
@@ -272,9 +266,7 @@ pub fn run_bit_parallel_64_pull(
                 queue.write_buffer(&params_bufs[k], 0, bytemuck::bytes_of(&p));
             }
             queue.write_buffer(&counter_buf, 0, bytemuck::bytes_of(&0u32));
-            total_write_buf += t_wb.elapsed();
 
-            let t_rec = std::time::Instant::now();
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: None,
             });
@@ -297,26 +289,12 @@ pub fn run_bit_parallel_64_pull(
             }
 
             encoder.copy_buffer_to_buffer(&counter_buf, 0, &staging_counter_buf, 0, 4);
-            total_pass_rec += t_rec.elapsed();
 
-            let t_sub = std::time::Instant::now();
             queue.submit(Some(encoder.finish()));
-            total_sub += t_sub.elapsed();
 
-            let t_read = std::time::Instant::now();
             let active = read_buffer_u32_blocking(device, &staging_counter_buf, 1)?[0];
-            total_read += t_read.elapsed();
 
             if active == 0 {
-                eprintln!(
-                    "[BP64-PULL PROFILE] Finished at level {}. Total loop: {:?}, write_buf: {:?}, pass_rec: {:?}, queue.submit: {:?}, blocking_read: {:?}",
-                    level,
-                    t_loop_start.elapsed(),
-                    total_write_buf,
-                    total_pass_rec,
-                    total_sub,
-                    total_read
-                );
                 break;
             }
 

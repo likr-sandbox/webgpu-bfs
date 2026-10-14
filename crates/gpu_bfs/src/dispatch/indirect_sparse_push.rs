@@ -22,8 +22,26 @@ use crate::{
     pipeline::PipelineCache,
 };
 
-/// Number of speculative hops pre-recorded per command encoder submission.
+/// Initial speculative hops pre-recorded on level 0 (covers power-law / scale-free diameters in 1 pass).
 pub const DEFAULT_MACRO_BATCH_HOPS: usize = 160;
+
+/// Speculative hops pre-recorded for intermediate levels (160 <= level < 480).
+pub const ADAPTIVE_MACRO_BATCH_HOPS_MED: usize = 320;
+
+/// Speculative hops pre-recorded for deep levels (level >= 480) on high-diameter graphs (e.g. road networks).
+pub const ADAPTIVE_MACRO_BATCH_HOPS_HIGH: usize = 512;
+
+/// Computes the speculative macro-batch chunk size adaptively based on the current BFS exploration depth.
+#[inline]
+pub fn determine_macro_chunk_hops(level: u32) -> usize {
+    if level == 0 {
+        DEFAULT_MACRO_BATCH_HOPS
+    } else if level < 480 {
+        ADAPTIVE_MACRO_BATCH_HOPS_MED
+    } else {
+        ADAPTIVE_MACRO_BATCH_HOPS_HIGH
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -1295,17 +1313,22 @@ fn execute_readback_512(
     let words_per_bank = bank_packed_words as usize;
 
     #[cfg(not(target_arch = "wasm32"))]
-    std::thread::scope(|s| {
-        for (dst_bank, src_bank) in active_dst
-            .chunks_mut(64 * nv)
-            .zip(packed_data[..num_banks * words_per_bank].chunks(words_per_bank))
-        {
-            s.spawn(move || {
-                let needed_words = (dst_bank.len() + 1) / 2;
-                unpack_u16_words_to_u32(&src_bank[..needed_words], dst_bank);
-            });
-        }
-    });
+    if num_banks == 1 {
+        let needed_words = (active_dst.len() + 1) / 2;
+        unpack_u16_words_to_u32_parallel(&packed_data[..needed_words], active_dst);
+    } else {
+        std::thread::scope(|s| {
+            for (dst_bank, src_bank) in active_dst
+                .chunks_mut(64 * nv)
+                .zip(packed_data[..num_banks * words_per_bank].chunks(words_per_bank))
+            {
+                s.spawn(move || {
+                    let needed_words = (dst_bank.len() + 1) / 2;
+                    unpack_u16_words_to_u32(&src_bank[..needed_words], dst_bank);
+                });
+            }
+        });
+    }
 
     #[cfg(target_arch = "wasm32")]
     for (dst_bank, src_bank) in active_dst
@@ -1378,11 +1401,12 @@ fn run_indirect_sparse_push_512_chunk(
     };
     queue.write_buffer(&bufs.init_sources_params_buf, 0, bytemuck::bytes_of(&init_src_p));
 
+    let active_words = ((active_sources + 31) / 32) as u32;
     let push_uniforms = PushUniforms {
         num_vertices: nv,
         chunk_start: chunk_start as u32,
         hub_threshold: 128,
-        num_words: 16,
+        num_words: active_words,
     };
     queue.write_buffer(&bufs.uniforms_buf, 0, bytemuck::bytes_of(&push_uniforms));
 
@@ -1419,7 +1443,7 @@ fn run_indirect_sparse_push_512_chunk(
     let mut distance_read = false;
 
     while level < max_hops {
-        let max_chunk = if level == 0 { DEFAULT_MACRO_BATCH_HOPS } else { 64 };
+        let max_chunk = determine_macro_chunk_hops(level);
         let chunk_len = (max_chunk as u32).min(max_hops - level) as usize;
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1580,17 +1604,22 @@ fn execute_readback_256(
     let words_per_bank = bank_packed_words as usize;
 
     #[cfg(not(target_arch = "wasm32"))]
-    std::thread::scope(|s| {
-        for (dst_bank, src_bank) in active_dst
-            .chunks_mut(64 * nv)
-            .zip(packed_data[..num_banks * words_per_bank].chunks(words_per_bank))
-        {
-            s.spawn(move || {
-                let needed_words = (dst_bank.len() + 1) / 2;
-                unpack_u16_words_to_u32(&src_bank[..needed_words], dst_bank);
-            });
-        }
-    });
+    if num_banks == 1 {
+        let needed_words = (active_dst.len() + 1) / 2;
+        unpack_u16_words_to_u32_parallel(&packed_data[..needed_words], active_dst);
+    } else {
+        std::thread::scope(|s| {
+            for (dst_bank, src_bank) in active_dst
+                .chunks_mut(64 * nv)
+                .zip(packed_data[..num_banks * words_per_bank].chunks(words_per_bank))
+            {
+                s.spawn(move || {
+                    let needed_words = (dst_bank.len() + 1) / 2;
+                    unpack_u16_words_to_u32(&src_bank[..needed_words], dst_bank);
+                });
+            }
+        });
+    }
 
     #[cfg(target_arch = "wasm32")]
     for (dst_bank, src_bank) in active_dst
@@ -1663,11 +1692,12 @@ fn run_indirect_sparse_push_256_chunk(
     };
     queue.write_buffer(&bufs.init_sources_params_buf, 0, bytemuck::bytes_of(&init_src_p));
 
+    let active_words = ((active_sources + 31) / 32) as u32;
     let push_uniforms = PushUniforms {
         num_vertices: nv,
         chunk_start: chunk_start as u32,
         hub_threshold: 128,
-        num_words: 8,
+        num_words: active_words,
     };
     queue.write_buffer(&bufs.uniforms_buf, 0, bytemuck::bytes_of(&push_uniforms));
 
@@ -1704,7 +1734,7 @@ fn run_indirect_sparse_push_256_chunk(
     let mut distance_read = false;
 
     while level < max_hops {
-        let max_chunk = if level == 0 { DEFAULT_MACRO_BATCH_HOPS } else { 64 };
+        let max_chunk = determine_macro_chunk_hops(level);
         let chunk_len = (max_chunk as u32).min(max_hops - level) as usize;
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1993,7 +2023,7 @@ pub fn run_indirect_sparse_push_into(
         }
     };
 
-    if num_sources >= 512 {
+    if num_sources > 256 {
         let pool_512 = match bufs.pool_512.as_mut() {
             Some(p) if p.num_vertices == num_vertices && p.num_edges == graph.num_edges => p,
             _ => {
@@ -2015,7 +2045,7 @@ pub fn run_indirect_sparse_push_into(
             )?;
         }
         return Ok(());
-    } else if num_sources >= 256 {
+    } else if num_sources > 64 {
         let pool_256 = match bufs.pool_256.as_mut() {
             Some(p) if p.num_vertices == num_vertices && p.num_edges == graph.num_edges => p,
             _ => {
@@ -2045,21 +2075,21 @@ pub fn run_indirect_sparse_push_into(
     let trav_pipeline = pipelines.indirect_sparse_push_pipeline();
     let pack_pipeline = pipelines.pack_distances_pipeline();
 
-    // Reset grid geometry: 2D dispatch for total_elements
-    let total_reset_elements = (64 * nv) as usize;
-    let total_reset_wgs = ((total_reset_elements + 255) / 256) as u32;
-    let (reset_dx, reset_dy) = if total_reset_wgs <= 65535 {
-        (total_reset_wgs.max(1), 1u32)
-    } else {
-        let dx = 256u32;
-        let dy = (total_reset_wgs + dx - 1) / dx;
-        (dx, dy)
-    };
-
     // Iterate over sources in chunks of up to 64
     for (batch_idx, batch_sources) in sources.chunks(64).enumerate() {
         let batch_size = batch_sources.len();
         let batch_start = batch_idx * 64;
+
+        // Reset grid geometry: 2D dispatch for exact active elements (batch_size * nv)
+        let total_reset_elements = (batch_size * num_vertices) as usize;
+        let total_reset_wgs = ((total_reset_elements + 255) / 256) as u32;
+        let (reset_dx, reset_dy) = if total_reset_wgs <= 65535 {
+            (total_reset_wgs.max(1), 1u32)
+        } else {
+            let dx = 256u32;
+            let dy = (total_reset_wgs + dx - 1) / dx;
+            (dx, dy)
+        };
 
         // Build list of unique source vertices for the initial active queue
         let mut unique_sources = Vec::with_capacity(batch_size);
@@ -2089,11 +2119,12 @@ pub fn run_indirect_sparse_push_into(
         };
         queue.write_buffer(&bufs.init_sources_params_buf, 0, bytemuck::bytes_of(&init_src_p));
 
+        let active_words = if batch_size <= 32 { 1u32 } else { 2u32 };
         let push_uniforms = PushUniforms {
             num_vertices: nv,
             chunk_start: 0,
-            hub_threshold: 0,
-            num_words: 2,
+            hub_threshold: 128,
+            num_words: active_words,
         };
         queue.write_buffer(&bufs.uniforms_buf, 0, bytemuck::bytes_of(&push_uniforms));
 
@@ -2112,7 +2143,7 @@ pub fn run_indirect_sparse_push_into(
         let total_packed_words = ((batch_elements + 1) / 2) as u32;
         let packed_bytes = (total_packed_words as u64) * 4;
 
-        let pack_wgs = ((total_packed_words + 255) / 256) as u32;
+        let pack_wgs = (total_packed_words + 255) / 256;
         let (pack_dx, pack_dy) = if pack_wgs <= 65535 {
             (pack_wgs.max(1), 1u32)
         } else {
@@ -2132,7 +2163,7 @@ pub fn run_indirect_sparse_push_into(
         let mut distance_read = false;
 
         while level < max_hops {
-            let max_chunk = if level == 0 { DEFAULT_MACRO_BATCH_HOPS } else { 64 };
+            let max_chunk = determine_macro_chunk_hops(level);
             let chunk_len = (max_chunk as u32).min(max_hops - level) as usize;
 
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -2260,7 +2291,7 @@ pub fn run_indirect_sparse_push_into(
                 let packed_data: &[u32] = bytemuck::cast_slice(&packed_view);
                 let start_dst = batch_start * num_vertices;
 
-                unpack_u16_words_to_u32(packed_data, &mut result[start_dst..start_dst + batch_elements]);
+                unpack_u16_words_to_u32_parallel(packed_data, &mut result[start_dst..start_dst + batch_elements]);
 
                 drop(packed_view);
                 bufs.staging_packed_buf.unmap();
@@ -2307,7 +2338,7 @@ pub fn run_indirect_sparse_push_into(
             let packed_data: &[u32] = bytemuck::cast_slice(&packed_view);
             let start_dst = batch_start * num_vertices;
 
-            unpack_u16_words_to_u32(packed_data, &mut result[start_dst..start_dst + batch_elements]);
+            unpack_u16_words_to_u32_parallel(packed_data, &mut result[start_dst..start_dst + batch_elements]);
 
             drop(packed_view);
             bufs.staging_packed_buf.unmap();
@@ -2335,5 +2366,44 @@ pub fn unpack_u16_words_to_u32(packed_words: &[u32], dst: &mut [u32]) {
         let p0 = last_word & 0xFFFF;
         let mask0 = ((p0 == 0xFFFF) as u32).wrapping_neg();
         dst[num_pairs * 2] = p0 | mask0;
+    }
+}
+
+/// Multi-threaded host unpacking across all CPU cores.
+/// Partitions dst into even-length chunks so that packed word indices remain aligned.
+pub fn unpack_u16_words_to_u32_parallel(packed_words: &[u32], dst: &mut [u32]) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        unpack_u16_words_to_u32(packed_words, dst);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let total_len = dst.len();
+        if total_len <= 32768 {
+            unpack_u16_words_to_u32(packed_words, dst);
+            return;
+        }
+
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8)
+            .min(16);
+
+        // Ensure chunk length is an even number of u32 elements
+        let raw_chunk = (total_len + num_threads - 1) / num_threads;
+        let chunk_elements = ((raw_chunk + 1) / 2) * 2;
+        let words_per_chunk = chunk_elements / 2;
+
+        std::thread::scope(|s| {
+            for (chunk_idx, dst_chunk) in dst.chunks_mut(chunk_elements).enumerate() {
+                let word_start = chunk_idx * words_per_chunk;
+                let needed_words = (dst_chunk.len() + 1) / 2;
+                let src_slice = &packed_words[word_start..word_start + needed_words];
+                s.spawn(move || {
+                    unpack_u16_words_to_u32(src_slice, dst_chunk);
+                });
+            }
+        });
     }
 }

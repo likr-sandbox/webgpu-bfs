@@ -92,8 +92,8 @@ pub struct PersistentPullBuffers512 {
     pub num_vertices: usize,
     pub num_edges: usize,
 
-    pub csc_col_offsets: wgpu::Buffer,
-    pub csc_row_indices: wgpu::Buffer,
+    pub csc_col_offsets: Arc<wgpu::Buffer>,
+    pub csc_row_indices: Arc<wgpu::Buffer>,
 
     pub frontier_buf_a: wgpu::Buffer,
     pub frontier_buf_b: wgpu::Buffer,
@@ -727,8 +727,9 @@ fn run_multi_word_bp_512_chunk(
                 _padding: [0; 3],
             };
             queue.write_buffer(&bufs.params_bufs[k], 0, bytemuck::bytes_of(&p));
-            queue.write_buffer(&bufs.counter_bufs[k], 0, bytemuck::bytes_of(&0u32));
         }
+        let last_k = chunk_len_steps - 1;
+        queue.write_buffer(&bufs.counter_bufs[last_k], 0, bytemuck::bytes_of(&0u32));
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Pull512 Hop Batch Encoder"),
@@ -777,20 +778,18 @@ fn run_multi_word_bp_512_chunk(
             pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
         }
 
-        for k in 0..chunk_len_steps {
-            encoder.copy_buffer_to_buffer(
-                &bufs.counter_bufs[k],
-                0,
-                &bufs.staging_counter_buf,
-                (k * 4) as u64,
-                4,
-            );
-        }
+        encoder.copy_buffer_to_buffer(
+            &bufs.counter_bufs[last_k],
+            0,
+            &bufs.staging_counter_buf,
+            0,
+            4,
+        );
 
         queue.submit(Some(encoder.finish()));
 
-        let counts = read_buffer_u32_blocking(device, &bufs.staging_counter_buf, chunk_len_steps)?;
-        if let Some(_zero_pos) = counts.iter().position(|&c| c == 0) {
+        let count = read_buffer_u32_blocking(device, &bufs.staging_counter_buf, 1)?[0];
+        if count == 0 {
             break;
         }
 
@@ -1140,8 +1139,9 @@ fn run_multi_word_bp_legacy(
                     _padding: [0; 3],
                 };
                 queue.write_buffer(&params_bufs[k], 0, bytemuck::bytes_of(&p));
-                queue.write_buffer(&counter_bufs[k], 0, bytemuck::bytes_of(&0u32));
             }
+            let last_k = chunk_len_steps - 1;
+            queue.write_buffer(&counter_bufs[last_k], 0, bytemuck::bytes_of(&0u32));
 
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("MultiWord Hop Batch Encoder"),
@@ -1163,20 +1163,18 @@ fn run_multi_word_bp_legacy(
                 pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
             }
 
-            for k in 0..chunk_len_steps {
-                encoder.copy_buffer_to_buffer(
-                    &counter_bufs[k],
-                    0,
-                    &staging_counter_buf,
-                    (k * 4) as u64,
-                    4,
-                );
-            }
+            encoder.copy_buffer_to_buffer(
+                &counter_bufs[last_k],
+                0,
+                &staging_counter_buf,
+                0,
+                4,
+            );
 
             queue.submit(Some(encoder.finish()));
 
-            let counts = read_buffer_u32_blocking(device, &staging_counter_buf, chunk_len_steps)?;
-            if let Some(_zero_pos) = counts.iter().position(|&c| c == 0) {
+            let count = read_buffer_u32_blocking(device, &staging_counter_buf, 1)?[0];
+            if count == 0 {
                 break;
             }
 

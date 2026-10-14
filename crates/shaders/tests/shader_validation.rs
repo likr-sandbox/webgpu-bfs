@@ -84,18 +84,19 @@ fn test_workgroup_storage_limits() {
         );
 
         if *name == "indirect_sparse_push.wgsl" {
-            // Must accommodate WG_QUEUE_CAP = 1024 (4,360 bytes total)
+            // Must accommodate WG_QUEUE_CAP = 2048 (~8.6KB total)
             assert!(
-                (4096..=8192).contains(&lds_size),
-                "indirect_sparse_push.wgsl LDS size should be ~4.3KB, but got {} bytes",
+                (4096..=12288).contains(&lds_size),
+                "indirect_sparse_push.wgsl LDS size should be ~8.6KB, but got {} bytes",
                 lds_size
             );
         }
 
         if *name == "indirect_sparse_push_256.wgsl" {
+            // Must accommodate WG_QUEUE_CAP = 2048 (~8.9KB total)
             assert!(
-                (4096..=8192).contains(&lds_size),
-                "indirect_sparse_push_256.wgsl LDS size should be ~4.8KB, but got {} bytes",
+                (4096..=12288).contains(&lds_size),
+                "indirect_sparse_push_256.wgsl LDS size should be ~8.9KB, but got {} bytes",
                 lds_size
             );
         }
