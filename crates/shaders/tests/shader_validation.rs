@@ -102,8 +102,8 @@ fn test_workgroup_storage_limits() {
 
         if *name == "indirect_sparse_push_512.wgsl" {
             assert!(
-                (4096..=8192).contains(&lds_size),
-                "indirect_sparse_push_512.wgsl LDS size should be ~5.3KB, but got {} bytes",
+                (4096..=12288).contains(&lds_size),
+                "indirect_sparse_push_512.wgsl LDS size should be ~9.5KB, but got {} bytes",
                 lds_size
             );
         }

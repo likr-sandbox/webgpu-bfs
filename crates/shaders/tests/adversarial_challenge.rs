@@ -62,12 +62,12 @@ fn parse_and_validate(name: &str, source: &str) -> Module {
 }
 
 #[test]
-fn test_adversarial_all_26_shaders_registered_and_valid() {
+fn test_adversarial_all_shaders_registered_and_valid() {
     let shaders = all_shaders();
     assert_eq!(
         shaders.len(),
-        26,
-        "Expected exactly 26 embedded shaders, but found {}",
+        27,
+        "Expected exactly 27 embedded shaders, but found {}",
         shaders.len()
     );
 

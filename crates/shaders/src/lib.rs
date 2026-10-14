@@ -81,6 +81,9 @@ pub const INIT_SPARSE_PUSH_SOURCES_256_WGSL: &str = include_str!("init_sparse_pu
 /// WGSL shader source for GPU source initialization for 512-source sparse push (Milestone M16).
 pub const INIT_SPARSE_PUSH_SOURCES_512_WGSL: &str = include_str!("init_sparse_push_sources_512.wgsl");
 
+/// WGSL shader source for 512-source multi-word bit-parallel pull traversal (Milestone M19).
+pub const MULTI_WORD_BP_PULL_512_WGSL: &str = include_str!("multi_word_bp_pull_512.wgsl");
+
 /// Returns a slice of tuples containing (filename, shader_source) for all embedded shaders.
 pub fn all_shaders() -> &'static [(&'static str, &'static str)] {
     &[
@@ -110,6 +113,7 @@ pub fn all_shaders() -> &'static [(&'static str, &'static str)] {
         ("indirect_sparse_push_512.wgsl", INDIRECT_SPARSE_PUSH_512_WGSL),
         ("init_sparse_push_sources_256.wgsl", INIT_SPARSE_PUSH_SOURCES_256_WGSL),
         ("init_sparse_push_sources_512.wgsl", INIT_SPARSE_PUSH_SOURCES_512_WGSL),
+        ("multi_word_bp_pull_512.wgsl", MULTI_WORD_BP_PULL_512_WGSL),
     ]
 }
 
@@ -265,5 +269,10 @@ mod tests {
     #[test]
     fn test_init_sparse_push_sources_512_syntax() {
         validate_wgsl_shader("init_sparse_push_sources_512.wgsl", INIT_SPARSE_PUSH_SOURCES_512_WGSL);
+    }
+
+    #[test]
+    fn test_multi_word_bp_pull_512_syntax() {
+        validate_wgsl_shader("multi_word_bp_pull_512.wgsl", MULTI_WORD_BP_PULL_512_WGSL);
     }
 }

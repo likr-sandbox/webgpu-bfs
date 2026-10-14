@@ -14,7 +14,11 @@ use crate::{
             run_indirect_sparse_push_into, run_indirect_sparse_push_pooled,
             PersistentSparsePushBuffers,
         },
-        multi_word_bp::run_multi_word_bp, multi_word_push::run_multi_word_bp_push,
+        multi_word_bp::{
+            run_multi_word_bp_into, run_multi_word_bp_pooled,
+            PersistentPullBuffers512,
+        },
+        multi_word_push::run_multi_word_bp_push,
         naive_seq::run_naive_sequential, push_pull::run_push_pull_adaptive,
         push_pull::PushPullConfig, sparse_bp::run_sparse_bp_64, sparse_queue::run_sparse_queue,
     },
@@ -50,6 +54,7 @@ pub struct GpuBfsEngine {
     pipelines: Arc<PipelineCache>,
     method: GpuBfsMethod,
     persistent_isqp: std::sync::Mutex<Option<PersistentSparsePushBuffers>>,
+    persistent_mwp: std::sync::Mutex<Option<PersistentPullBuffers512>>,
 }
 
 impl GpuBfsEngine {
@@ -61,6 +66,7 @@ impl GpuBfsEngine {
             pipelines,
             method,
             persistent_isqp: std::sync::Mutex::new(None),
+            persistent_mwp: std::sync::Mutex::new(None),
         })
     }
 
@@ -246,6 +252,17 @@ impl GpuBfsEngine {
                     out,
                 )
             }
+            GpuBfsMethod::MultiWordBitParallel => {
+                let mut guard = self.persistent_mwp.lock().unwrap();
+                run_multi_word_bp_into(
+                    &self.context,
+                    &self.pipelines,
+                    graph,
+                    sources,
+                    Some(&mut *guard),
+                    out,
+                )
+            }
             other => {
                 let res = self.run_ms_bfs_with_method(other, graph, sources)?;
                 out.copy_from_slice(&res);
@@ -323,7 +340,14 @@ impl GpuBfsEngine {
                 run_sparse_bp_64(&self.context, &self.pipelines, graph, sources)
             }
             GpuBfsMethod::MultiWordBitParallel => {
-                run_multi_word_bp(&self.context, &self.pipelines, graph, sources)
+                let mut guard = self.persistent_mwp.lock().unwrap();
+                run_multi_word_bp_pooled(
+                    &self.context,
+                    &self.pipelines,
+                    graph,
+                    sources,
+                    Some(&mut *guard),
+                )
             }
             GpuBfsMethod::IndirectMacroBatch => {
                 run_indirect_macro_batch(&self.context, &self.pipelines, graph, sources)
@@ -351,3 +375,191 @@ impl BfsEngine for GpuBfsEngine {
         self.run_ms_bfs_with_method(effective_method, graph, sources)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_graph_with_max_degree(max_deg: usize) -> CsrGraph {
+        let nv = max_deg + 2;
+        let edges: Vec<(u32, u32)> = (1..=max_deg as u32).map(|v| (0, v)).collect();
+        CsrGraph::from_edge_list(nv, &edges)
+    }
+
+    #[test]
+    fn test_select_auto_method_empty_and_zero_sources() {
+        let empty = CsrGraph::from_edge_list(0, &[]);
+        assert_eq!(
+            GpuBfsEngine::select_auto_method(&empty, 64),
+            GpuBfsMethod::NaiveSequential
+        );
+
+        let g = make_graph_with_max_degree(5);
+        assert_eq!(
+            GpuBfsEngine::select_auto_method(&g, 0),
+            GpuBfsMethod::NaiveSequential
+        );
+    }
+
+    #[test]
+    fn test_select_auto_method_low_degree_graphs() {
+        // max_degree <= 32: road networks (e.g. luxembourg_osm has max_degree 7), planar grids, trees
+        for &deg in &[0, 1, 4, 7, 16, 32] {
+            let g = make_graph_with_max_degree(deg);
+            assert_eq!(g.max_degree(), deg);
+
+            // S = 1 -> SparseQueue
+            assert_eq!(
+                GpuBfsEngine::select_auto_method(&g, 1),
+                GpuBfsMethod::SparseQueue
+            );
+
+            // 1 < S < 32 -> BitParallel32
+            assert_eq!(
+                GpuBfsEngine::select_auto_method(&g, 2),
+                GpuBfsMethod::BitParallel32
+            );
+            assert_eq!(
+                GpuBfsEngine::select_auto_method(&g, 16),
+                GpuBfsMethod::BitParallel32
+            );
+            assert_eq!(
+                GpuBfsEngine::select_auto_method(&g, 31),
+                GpuBfsMethod::BitParallel32
+            );
+
+            // 32 <= S < 64 -> BitParallel64
+            assert_eq!(
+                GpuBfsEngine::select_auto_method(&g, 32),
+                GpuBfsMethod::BitParallel64
+            );
+            assert_eq!(
+                GpuBfsEngine::select_auto_method(&g, 63),
+                GpuBfsMethod::BitParallel64
+            );
+
+            // S >= 64 -> MultiWordBitParallel
+            assert_eq!(
+                GpuBfsEngine::select_auto_method(&g, 64),
+                GpuBfsMethod::MultiWordBitParallel
+            );
+            assert_eq!(
+                GpuBfsEngine::select_auto_method(&g, 256),
+                GpuBfsMethod::MultiWordBitParallel
+            );
+            assert_eq!(
+                GpuBfsEngine::select_auto_method(&g, 512),
+                GpuBfsMethod::MultiWordBitParallel
+            );
+            assert_eq!(
+                GpuBfsEngine::select_auto_method(&g, 1024),
+                GpuBfsMethod::MultiWordBitParallel
+            );
+            assert_eq!(
+                GpuBfsEngine::select_auto_method(&g, 2048),
+                GpuBfsMethod::MultiWordBitParallel
+            );
+        }
+    }
+
+    #[test]
+    fn test_select_auto_method_intermediate_degree_graphs() {
+        // 32 < max_degree < 128
+        for &deg in &[33, 50, 64, 100, 127] {
+            let g = make_graph_with_max_degree(deg);
+            assert_eq!(g.max_degree(), deg);
+
+            // S = 1 -> SparseQueue
+            assert_eq!(
+                GpuBfsEngine::select_auto_method(&g, 1),
+                GpuBfsMethod::SparseQueue
+            );
+
+            // 1 < S < 32 -> BitParallel32
+            assert_eq!(
+                GpuBfsEngine::select_auto_method(&g, 16),
+                GpuBfsMethod::BitParallel32
+            );
+
+            // 32 <= S < 64 -> BitParallel64
+            assert_eq!(
+                GpuBfsEngine::select_auto_method(&g, 32),
+                GpuBfsMethod::BitParallel64
+            );
+            assert_eq!(
+                GpuBfsEngine::select_auto_method(&g, 63),
+                GpuBfsMethod::BitParallel64
+            );
+
+            // S >= 64 -> IndirectSparseQueuePush
+            assert_eq!(
+                GpuBfsEngine::select_auto_method(&g, 64),
+                GpuBfsMethod::IndirectSparseQueuePush
+            );
+            assert_eq!(
+                GpuBfsEngine::select_auto_method(&g, 512),
+                GpuBfsMethod::IndirectSparseQueuePush
+            );
+            assert_eq!(
+                GpuBfsEngine::select_auto_method(&g, 2048),
+                GpuBfsMethod::IndirectSparseQueuePush
+            );
+        }
+    }
+
+    #[test]
+    fn test_select_auto_method_high_degree_hub_graphs() {
+        // max_degree >= 128: web graphs (web-Stanford), social graphs, star hubs
+        for &deg in &[128, 256, 1024, 38625] {
+            let g = make_graph_with_max_degree(deg);
+            assert_eq!(g.max_degree(), deg);
+
+            // S = 1 -> SparseQueue
+            assert_eq!(
+                GpuBfsEngine::select_auto_method(&g, 1),
+                GpuBfsMethod::SparseQueue
+            );
+
+            // 1 < S < 64 -> BitParallel64
+            assert_eq!(
+                GpuBfsEngine::select_auto_method(&g, 2),
+                GpuBfsMethod::BitParallel64
+            );
+            assert_eq!(
+                GpuBfsEngine::select_auto_method(&g, 16),
+                GpuBfsMethod::BitParallel64
+            );
+            assert_eq!(
+                GpuBfsEngine::select_auto_method(&g, 32),
+                GpuBfsMethod::BitParallel64
+            );
+            assert_eq!(
+                GpuBfsEngine::select_auto_method(&g, 63),
+                GpuBfsMethod::BitParallel64
+            );
+
+            // S >= 64 -> IndirectSparseQueuePush
+            assert_eq!(
+                GpuBfsEngine::select_auto_method(&g, 64),
+                GpuBfsMethod::IndirectSparseQueuePush
+            );
+            assert_eq!(
+                GpuBfsEngine::select_auto_method(&g, 256),
+                GpuBfsMethod::IndirectSparseQueuePush
+            );
+            assert_eq!(
+                GpuBfsEngine::select_auto_method(&g, 512),
+                GpuBfsMethod::IndirectSparseQueuePush
+            );
+            assert_eq!(
+                GpuBfsEngine::select_auto_method(&g, 1024),
+                GpuBfsMethod::IndirectSparseQueuePush
+            );
+            assert_eq!(
+                GpuBfsEngine::select_auto_method(&g, 2048),
+                GpuBfsMethod::IndirectSparseQueuePush
+            );
+        }
+    }
+}
+

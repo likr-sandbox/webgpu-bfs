@@ -10,6 +10,7 @@ use webgpu_bfs_shaders::{
     SPARSE_BP_PUSH_WGSL, SPARSE_QUEUE_PUSH_WGSL, PACK_DISTANCES_U32_TO_U16_WGSL,
     INDIRECT_SPARSE_PUSH_256_WGSL, INDIRECT_SPARSE_PUSH_512_WGSL,
     INIT_SPARSE_PUSH_SOURCES_256_WGSL, INIT_SPARSE_PUSH_SOURCES_512_WGSL,
+    MULTI_WORD_BP_PULL_512_WGSL,
 };
 use wgpu::{
     BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType,
@@ -100,6 +101,10 @@ pub struct PipelineCache {
     indirect_sparse_push_512_pipeline: ComputePipeline,
     init_sparse_sources_512_layout: BindGroupLayout,
     init_sparse_sources_512_pipeline: ComputePipeline,
+
+    // Milestone 19: Multi-Word Bit-Parallel Pull Pipeline (512 width, 8 Distance Banks)
+    multi_word_bp_pull_512_layout: BindGroupLayout,
+    multi_word_bp_pull_512_pipeline: ComputePipeline,
 }
 
 impl PipelineCache {
@@ -577,6 +582,36 @@ impl PipelineCache {
             INIT_SPARSE_PUSH_SOURCES_512_WGSL,
         );
 
+        // Milestone 19: Multi-Word Bit-Parallel Pull Layout (15 entries: 1 uniform + 14 storage)
+        let multi_word_bp_pull_512_layout =
+            device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+                label: Some("multi_word_bp_pull_512_bgl"),
+                entries: &[
+                    Self::bgl_uniform(0),     // params: Params
+                    Self::bgl_storage_ro(1),  // row_ptr
+                    Self::bgl_storage_ro(2),  // col_ind
+                    Self::bgl_storage_ro(3),  // curr_frontier
+                    Self::bgl_storage_rw(4),  // visited
+                    Self::bgl_storage_rw(5),  // next_frontier
+                    Self::bgl_storage_rw(6),  // active_count
+                    Self::bgl_storage_rw(7),  // dist_bank0
+                    Self::bgl_storage_rw(8),  // dist_bank1
+                    Self::bgl_storage_rw(9),  // dist_bank2
+                    Self::bgl_storage_rw(10), // dist_bank3
+                    Self::bgl_storage_rw(11), // dist_bank4
+                    Self::bgl_storage_rw(12), // dist_bank5
+                    Self::bgl_storage_rw(13), // dist_bank6
+                    Self::bgl_storage_rw(14), // dist_bank7
+                ],
+            });
+
+        let multi_word_bp_pull_512_pipeline = Self::create_compute_pipeline(
+            device,
+            "multi_word_bp_pull_512_pipeline",
+            &multi_word_bp_pull_512_layout,
+            MULTI_WORD_BP_PULL_512_WGSL,
+        );
+
         Ok(Self {
             naive_layout,
             naive_pipeline,
@@ -626,6 +661,8 @@ impl PipelineCache {
             indirect_sparse_push_512_pipeline,
             init_sparse_sources_512_layout,
             init_sparse_sources_512_pipeline,
+            multi_word_bp_pull_512_layout,
+            multi_word_bp_pull_512_pipeline,
         })
     }
 
@@ -948,6 +985,15 @@ impl PipelineCache {
 
     pub fn init_sparse_sources_512_pipeline(&self) -> &ComputePipeline {
         &self.init_sparse_sources_512_pipeline
+    }
+
+    // Milestone 19: Multi-Word Bit-Parallel Pull (512 width, 8 Distance Banks)
+    pub fn multi_word_bp_pull_512_layout(&self) -> &BindGroupLayout {
+        &self.multi_word_bp_pull_512_layout
+    }
+
+    pub fn multi_word_bp_pull_512_pipeline(&self) -> &ComputePipeline {
+        &self.multi_word_bp_pull_512_pipeline
     }
 }
 
