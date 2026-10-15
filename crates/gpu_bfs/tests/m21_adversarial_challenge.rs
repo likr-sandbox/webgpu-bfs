@@ -106,13 +106,13 @@ fn test_select_auto_method_adversarial_topologies() {
     let iso = isolated_vertices(100);
     assert_eq!(iso.max_degree(), 0);
     assert_eq!(GpuBfsEngine::select_auto_method(&iso, 0), GpuBfsMethod::NaiveSequential);
-    assert_eq!(GpuBfsEngine::select_auto_method(&iso, 1), GpuBfsMethod::SparseQueue);
-    assert_eq!(GpuBfsEngine::select_auto_method(&iso, 16), GpuBfsMethod::BitParallel32);
-    assert_eq!(GpuBfsEngine::select_auto_method(&iso, 32), GpuBfsMethod::BitParallel64);
-    assert_eq!(GpuBfsEngine::select_auto_method(&iso, 64), GpuBfsMethod::MultiWordBitParallel);
-    assert_eq!(GpuBfsEngine::select_auto_method(&iso, 512), GpuBfsMethod::MultiWordBitParallel);
+    assert_eq!(GpuBfsEngine::select_auto_method(&iso, 1), GpuBfsMethod::WorkgroupPersistentBfs);
+    assert_eq!(GpuBfsEngine::select_auto_method(&iso, 16), GpuBfsMethod::WorkgroupPersistentBfs);
+    assert_eq!(GpuBfsEngine::select_auto_method(&iso, 32), GpuBfsMethod::WorkgroupPersistentBfs);
+    assert_eq!(GpuBfsEngine::select_auto_method(&iso, 64), GpuBfsMethod::WorkgroupPersistentBfs);
+    assert_eq!(GpuBfsEngine::select_auto_method(&iso, 512), GpuBfsMethod::WorkgroupPersistentBfs);
 
-    // 1.3 Disjoint Cliques: Low-degree (max_degree 19 <= 32)
+    // 1.3 Disjoint Cliques: Low-degree (max_degree 19)
     let low_cliques = disconnected_cliques(&[5, 10, 20]);
     assert_eq!(low_cliques.max_degree(), 19);
     assert_eq!(GpuBfsEngine::select_auto_method(&low_cliques, 1), GpuBfsMethod::SparseQueue);
@@ -121,14 +121,14 @@ fn test_select_auto_method_adversarial_topologies() {
     assert_eq!(GpuBfsEngine::select_auto_method(&low_cliques, 64), GpuBfsMethod::MultiWordBitParallel);
     assert_eq!(GpuBfsEngine::select_auto_method(&low_cliques, 512), GpuBfsMethod::MultiWordBitParallel);
 
-    // 1.4 Disjoint Cliques: Intermediate (max_degree 49 in (32, 128))
+    // 1.4 Disjoint Cliques: Intermediate (max_degree 49 in (8, 128))
     let mid_cliques = disconnected_cliques(&[10, 20, 50]);
     assert_eq!(mid_cliques.max_degree(), 49);
     assert_eq!(GpuBfsEngine::select_auto_method(&mid_cliques, 1), GpuBfsMethod::SparseQueue);
     assert_eq!(GpuBfsEngine::select_auto_method(&mid_cliques, 16), GpuBfsMethod::BitParallel32);
     assert_eq!(GpuBfsEngine::select_auto_method(&mid_cliques, 32), GpuBfsMethod::BitParallel64);
-    assert_eq!(GpuBfsEngine::select_auto_method(&mid_cliques, 64), GpuBfsMethod::IndirectSparseQueuePush);
-    assert_eq!(GpuBfsEngine::select_auto_method(&mid_cliques, 512), GpuBfsMethod::IndirectSparseQueuePush);
+    assert_eq!(GpuBfsEngine::select_auto_method(&mid_cliques, 64), GpuBfsMethod::MultiWordBitParallel);
+    assert_eq!(GpuBfsEngine::select_auto_method(&mid_cliques, 512), GpuBfsMethod::MultiWordBitParallel);
 
     // 1.5 Disjoint Cliques: Massive Hub (max_degree 199 >= 128)
     let hub_cliques = disconnected_cliques(&[10, 20, 200]);
@@ -156,7 +156,7 @@ fn test_select_auto_method_adversarial_topologies() {
     assert_eq!(GpuBfsEngine::select_auto_method(&star_small, 64), GpuBfsMethod::MultiWordBitParallel);
 
     let star_mid = star_graph(70); // max_degree = 69
-    assert_eq!(GpuBfsEngine::select_auto_method(&star_mid, 64), GpuBfsMethod::IndirectSparseQueuePush);
+    assert_eq!(GpuBfsEngine::select_auto_method(&star_mid, 64), GpuBfsMethod::MultiWordBitParallel);
 
     let star_huge = star_graph(1000); // max_degree = 999
     assert_eq!(GpuBfsEngine::select_auto_method(&star_huge, 1), GpuBfsMethod::IndirectSparseQueuePush);
@@ -169,31 +169,31 @@ fn test_select_auto_method_adversarial_topologies() {
 
     // 1.9 Grid meshes
     let grid_sq = Grid2D::new(30, 30).unwrap().graph; // max_degree = 4
-    assert_eq!(GpuBfsEngine::select_auto_method(&grid_sq, 1), GpuBfsMethod::SparseQueue);
-    assert_eq!(GpuBfsEngine::select_auto_method(&grid_sq, 16), GpuBfsMethod::BitParallel32);
-    assert_eq!(GpuBfsEngine::select_auto_method(&grid_sq, 32), GpuBfsMethod::BitParallel64);
-    assert_eq!(GpuBfsEngine::select_auto_method(&grid_sq, 64), GpuBfsMethod::MultiWordBitParallel);
-    assert_eq!(GpuBfsEngine::select_auto_method(&grid_sq, 512), GpuBfsMethod::MultiWordBitParallel);
+    assert_eq!(GpuBfsEngine::select_auto_method(&grid_sq, 1), GpuBfsMethod::WorkgroupPersistentBfs);
+    assert_eq!(GpuBfsEngine::select_auto_method(&grid_sq, 16), GpuBfsMethod::WorkgroupPersistentBfs);
+    assert_eq!(GpuBfsEngine::select_auto_method(&grid_sq, 32), GpuBfsMethod::WorkgroupPersistentBfs);
+    assert_eq!(GpuBfsEngine::select_auto_method(&grid_sq, 64), GpuBfsMethod::WorkgroupPersistentBfs);
+    assert_eq!(GpuBfsEngine::select_auto_method(&grid_sq, 512), GpuBfsMethod::WorkgroupPersistentBfs);
 
     let grid_narrow = generate_grid2d(2, 200); // max_degree = 3
-    assert_eq!(GpuBfsEngine::select_auto_method(&grid_narrow, 64), GpuBfsMethod::MultiWordBitParallel);
+    assert_eq!(GpuBfsEngine::select_auto_method(&grid_narrow, 64), GpuBfsMethod::WorkgroupPersistentBfs);
 }
 
 #[test]
 fn test_select_auto_method_exact_degree_boundaries() {
-    // Boundary 1: max_degree == 32 vs 33
-    let g32 = make_graph_with_exact_max_degree(32);
-    let g33 = make_graph_with_exact_max_degree(33);
-    assert_eq!(g32.max_degree(), 32);
-    assert_eq!(g33.max_degree(), 33);
+    // Boundary 1: max_degree == 8 vs 9
+    let g8 = make_graph_with_exact_max_degree(8);
+    let g9 = make_graph_with_exact_max_degree(9);
+    assert_eq!(g8.max_degree(), 8);
+    assert_eq!(g9.max_degree(), 9);
 
-    // S = 64: 32 routes to MultiWordBitParallel, 33 routes to IndirectSparseQueuePush
-    assert_eq!(GpuBfsEngine::select_auto_method(&g32, 64), GpuBfsMethod::MultiWordBitParallel);
-    assert_eq!(GpuBfsEngine::select_auto_method(&g33, 64), GpuBfsMethod::IndirectSparseQueuePush);
+    // S = 64: 8 routes to WorkgroupPersistentBfs, 9 routes to MultiWordBitParallel
+    assert_eq!(GpuBfsEngine::select_auto_method(&g8, 64), GpuBfsMethod::WorkgroupPersistentBfs);
+    assert_eq!(GpuBfsEngine::select_auto_method(&g9, 64), GpuBfsMethod::MultiWordBitParallel);
 
-    // S = 16: both route to BitParallel32
-    assert_eq!(GpuBfsEngine::select_auto_method(&g32, 16), GpuBfsMethod::BitParallel32);
-    assert_eq!(GpuBfsEngine::select_auto_method(&g33, 16), GpuBfsMethod::BitParallel32);
+    // S = 16: 8 routes to WorkgroupPersistentBfs, 9 routes to BitParallel32
+    assert_eq!(GpuBfsEngine::select_auto_method(&g8, 16), GpuBfsMethod::WorkgroupPersistentBfs);
+    assert_eq!(GpuBfsEngine::select_auto_method(&g9, 16), GpuBfsMethod::BitParallel32);
 
     // Boundary 2: max_degree == 127 vs 128
     let g127 = make_graph_with_exact_max_degree(127);
@@ -205,8 +205,8 @@ fn test_select_auto_method_exact_degree_boundaries() {
     assert_eq!(GpuBfsEngine::select_auto_method(&g127, 16), GpuBfsMethod::BitParallel32);
     assert_eq!(GpuBfsEngine::select_auto_method(&g128, 16), GpuBfsMethod::IndirectSparseQueuePush);
 
-    // S = 64: both route to IndirectSparseQueuePush
-    assert_eq!(GpuBfsEngine::select_auto_method(&g127, 64), GpuBfsMethod::IndirectSparseQueuePush);
+    // S = 64: 127 routes to MultiWordBitParallel, 128 routes to IndirectSparseQueuePush
+    assert_eq!(GpuBfsEngine::select_auto_method(&g127, 64), GpuBfsMethod::MultiWordBitParallel);
     assert_eq!(GpuBfsEngine::select_auto_method(&g128, 64), GpuBfsMethod::IndirectSparseQueuePush);
 }
 

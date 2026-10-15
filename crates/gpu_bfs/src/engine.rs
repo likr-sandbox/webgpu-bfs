@@ -1,8 +1,6 @@
-//! `GpuBfsEngine` implementation of `webgpu_bfs_core::BfsEngine`.
-
 use anyhow::{bail, Result};
 use std::sync::Arc;
-use webgpu_bfs_core::{BfsEngine, CsrGraph};
+use webgpu_bfs_core::{BfsEngine, CsrGraph, ReachabilityBitmask, ReachabilityEngine};
 
 use crate::{
     context::GpuContext,
@@ -12,15 +10,20 @@ use crate::{
         boolean_reachability::run_boolean_reachability, indirect::run_indirect_macro_batch,
         indirect_sparse_push::{
             run_indirect_sparse_push_into, run_indirect_sparse_push_pooled,
-            PersistentSparsePushBuffers,
+            run_indirect_sparse_push_reachability, PersistentSparsePushBuffers,
         },
         multi_word_bp::{
             run_multi_word_bp_into, run_multi_word_bp_pooled,
+            run_multi_word_bp_reachability_pooled,
             PersistentPullBuffers512,
         },
         multi_word_push::run_multi_word_bp_push,
         naive_seq::run_naive_sequential, push_pull::run_push_pull_adaptive,
         push_pull::PushPullConfig, sparse_bp::run_sparse_bp_64, sparse_queue::run_sparse_queue,
+        workgroup_persistent::{
+            run_workgroup_persistent_bfs_into, run_workgroup_persistent_bfs_pooled,
+            run_workgroup_persistent_reachability, PersistentWorkgroupBfsBuffers,
+        },
     },
     pipeline::PipelineCache,
 };
@@ -44,6 +47,8 @@ pub enum GpuBfsMethod {
     IndirectSparseQueuePush,
     /// Milestone M12: Multi-Word Bit-Parallel Push for massive batches (S >= 128..2048).
     MultiWordBitParallelPush,
+    /// Milestone M26: Autonomous Workgroup-Persistent BFS for low-degree / high-diameter graphs.
+    WorkgroupPersistentBfs,
     /// Milestone M17: Topology-aware automatic method selection.
     Auto,
 }
@@ -55,6 +60,7 @@ pub struct GpuBfsEngine {
     method: GpuBfsMethod,
     persistent_isqp: std::sync::Mutex<Option<PersistentSparsePushBuffers>>,
     persistent_mwp: std::sync::Mutex<Option<PersistentPullBuffers512>>,
+    persistent_wp_bfs: std::sync::Mutex<Option<PersistentWorkgroupBfsBuffers>>,
 }
 
 impl GpuBfsEngine {
@@ -67,6 +73,7 @@ impl GpuBfsEngine {
             method,
             persistent_isqp: std::sync::Mutex::new(None),
             persistent_mwp: std::sync::Mutex::new(None),
+            persistent_wp_bfs: std::sync::Mutex::new(None),
         })
     }
 
@@ -136,39 +143,50 @@ impl GpuBfsEngine {
         Self::new(context, GpuBfsMethod::MultiWordBitParallelPush)
     }
 
+    /// Creates an engine using the `WorkgroupPersistentBfs` method (Milestone M26).
+    pub fn workgroup_persistent_bfs(context: Arc<GpuContext>) -> Result<Self> {
+        Self::new(context, GpuBfsMethod::WorkgroupPersistentBfs)
+    }
+
     /// Creates an engine with topology-aware automatic method selection (Milestone M17).
     pub fn auto(context: Arc<GpuContext>) -> Result<Self> {
         Self::new(context, GpuBfsMethod::Auto)
     }
 
-    /// Selects the optimal BFS method based on graph degree distribution and batch size.
+    /// Selects the optimal BFS method based on graph topology, degree distribution, and batch size.
     pub fn select_auto_method(graph: &CsrGraph, num_sources: usize) -> GpuBfsMethod {
         if graph.is_empty() || num_sources == 0 {
             return GpuBfsMethod::NaiveSequential;
         }
 
         let max_degree = graph.max_degree();
+        let num_vertices = graph.num_vertices;
+        let num_edges = graph.num_edges;
 
-        if max_degree <= 32 {
-            // Branch 1: Degree-uniform road networks, planar meshes, and regular trees
-            if num_sources >= 64 {
-                GpuBfsMethod::MultiWordBitParallel
-            } else if num_sources >= 32 {
-                GpuBfsMethod::BitParallel64
-            } else if num_sources > 1 {
-                GpuBfsMethod::BitParallel32
-            } else {
-                GpuBfsMethod::SparseQueue
-            }
+        // Condition for road networks and narrow bounded-degree graphs:
+        // Real-world road networks (e.g. luxembourg_osm: d_max=7, |E|/|V|=2.08) and 1D paths
+        // have small max degree (<= 8) and sparse edge density (|E| <= 4 * |V|).
+        let is_road_or_narrow = max_degree <= 8 && num_edges <= 4 * num_vertices;
+
+        if is_road_or_narrow {
+            // Branch 1: Road networks and narrow bounded-degree graphs (Milestone M26)
+            // WorkgroupPersistentBfs executes autonomous 1 workgroup/source exploration in 1 dispatch
+            // with 0 host-device sync roundtrips and 100% bitwise parity.
+            // Any pathological wavefront expansion > 508 is caught by GPU overflow detection
+            // and transparently falls back to MultiWordBitParallel.
+            GpuBfsMethod::WorkgroupPersistentBfs
         } else if max_degree >= 128 {
-            // Branch 2: Scale-free power-law graphs with massive hubs
-            // M22: Pooled IndirectSparseQueuePush with exact reset and M20 hub optimizations
+            // Branch 2: Scale-free power-law graphs with massive hubs (web-Stanford, etc.)
+            // Milestone M22: Pooled IndirectSparseQueuePush with exact reset and M20 hub optimizations
             // is strictly superior across all batch sizes (S >= 1).
             GpuBfsMethod::IndirectSparseQueuePush
         } else {
-            // Branch 3: Intermediate density graphs (32 < max_degree < 128)
+            // Branch 3: Expander / ER / dense mesh / intermediate density graphs
+            // (|E|/|V| > 4.0 or max_degree > 8, with max_degree < 128)
             if num_sources >= 64 {
-                GpuBfsMethod::IndirectSparseQueuePush
+                // Large batches on expander/ER graphs: MultiWordBitParallel pull eliminates
+                // atomic collisions and handles broad expanding wavefronts.
+                GpuBfsMethod::MultiWordBitParallel
             } else if num_sources >= 32 {
                 GpuBfsMethod::BitParallel64
             } else if num_sources > 1 {
@@ -251,6 +269,17 @@ impl GpuBfsEngine {
             GpuBfsMethod::MultiWordBitParallel => {
                 let mut guard = self.persistent_mwp.lock().unwrap();
                 run_multi_word_bp_into(
+                    &self.context,
+                    &self.pipelines,
+                    graph,
+                    sources,
+                    Some(&mut *guard),
+                    out,
+                )
+            }
+            GpuBfsMethod::WorkgroupPersistentBfs => {
+                let mut guard = self.persistent_wp_bfs.lock().unwrap();
+                run_workgroup_persistent_bfs_into(
                     &self.context,
                     &self.pipelines,
                     graph,
@@ -361,6 +390,16 @@ impl GpuBfsEngine {
             GpuBfsMethod::MultiWordBitParallelPush => {
                 run_multi_word_bp_push(&self.context, &self.pipelines, graph, sources)
             }
+            GpuBfsMethod::WorkgroupPersistentBfs => {
+                let mut guard = self.persistent_wp_bfs.lock().unwrap();
+                run_workgroup_persistent_bfs_pooled(
+                    &self.context,
+                    &self.pipelines,
+                    graph,
+                    sources,
+                    Some(&mut *guard),
+                )
+            }
         }
     }
 }
@@ -369,6 +408,84 @@ impl BfsEngine for GpuBfsEngine {
     fn run_ms_bfs(&self, graph: &CsrGraph, sources: &[u32]) -> Result<Vec<u32>> {
         let effective_method = self.resolve_method(graph, sources);
         self.run_ms_bfs_with_method(effective_method, graph, sources)
+    }
+}
+
+impl GpuBfsEngine {
+    /// Executes Multi-Source Reachability query returning a compact `ReachabilityBitmask`.
+    ///
+    /// For power-law graphs or `IndirectSparseQueuePush`, this executes GPU traversal and
+    /// directly DMAs the visited bitmask buffer without distance matrix allocation or packing.
+    /// For other methods, it executes BFS and canonicalizes distances into the bitmask.
+    pub fn run_ms_reachability(
+        &self,
+        graph: &CsrGraph,
+        sources: &[u32],
+    ) -> Result<ReachabilityBitmask> {
+        let num_vertices = graph.num_vertices;
+        let num_sources = sources.len();
+
+        if num_sources == 0 || num_vertices == 0 {
+            return Ok(ReachabilityBitmask::zeroed(num_vertices, num_sources));
+        }
+
+        for (i, &s) in sources.iter().enumerate() {
+            if s as usize >= num_vertices {
+                bail!(
+                    "Source vertex {} at index {} exceeds graph vertex count {}",
+                    s,
+                    i,
+                    num_vertices
+                );
+            }
+        }
+
+        let effective_method = self.resolve_method(graph, sources);
+        if effective_method == GpuBfsMethod::IndirectSparseQueuePush {
+            let mut guard = self.persistent_isqp.lock().unwrap();
+            run_indirect_sparse_push_reachability(
+                &self.context,
+                &self.pipelines,
+                graph,
+                sources,
+                Some(&mut *guard),
+            )
+        } else if effective_method == GpuBfsMethod::WorkgroupPersistentBfs {
+            let mut guard = self.persistent_wp_bfs.lock().unwrap();
+            run_workgroup_persistent_reachability(
+                &self.context,
+                &self.pipelines,
+                graph,
+                sources,
+                Some(&mut *guard),
+            )
+        } else if effective_method == GpuBfsMethod::MultiWordBitParallel {
+            let mut guard = self.persistent_mwp.lock().unwrap();
+            run_multi_word_bp_reachability_pooled(
+                &self.context,
+                &self.pipelines,
+                graph,
+                sources,
+                &mut guard,
+            )
+        } else {
+            let distances = self.run_ms_bfs_with_method(effective_method, graph, sources)?;
+            Ok(ReachabilityBitmask::from_canonical_distances(
+                num_vertices,
+                num_sources,
+                &distances,
+            ))
+        }
+    }
+}
+
+impl ReachabilityEngine for GpuBfsEngine {
+    fn run_reachability(
+        &self,
+        graph: &CsrGraph,
+        sources: &[u32],
+    ) -> Result<ReachabilityBitmask> {
+        self.run_ms_reachability(graph, sources)
     }
 }
 
@@ -399,8 +516,33 @@ mod tests {
 
     #[test]
     fn test_select_auto_method_low_degree_graphs() {
-        // max_degree <= 32: road networks (e.g. luxembourg_osm has max_degree 7), planar grids, trees
-        for &deg in &[0, 1, 4, 7, 16, 32] {
+        // max_degree <= 8 and |E| <= 4*V: road networks (e.g. luxembourg_osm has max_degree 7), planar grids, trees
+        // Milestone M26: WorkgroupPersistentBfs is selected for all batch sizes S >= 1.
+        for &deg in &[0, 1, 4, 7, 8] {
+            let g = make_graph_with_max_degree(deg);
+            assert_eq!(g.max_degree(), deg);
+
+            for &s in &[1, 2, 16, 31, 32, 63, 64, 256, 512, 1024, 2048] {
+                assert_eq!(
+                    GpuBfsEngine::select_auto_method(&g, s),
+                    GpuBfsMethod::WorkgroupPersistentBfs,
+                    "Failed for deg={deg}, s={s}"
+                );
+            }
+        }
+
+        // Boundary: deg = 9 (d_max > 8, falls into intermediate/expander branch)
+        let g9 = make_graph_with_max_degree(9);
+        assert_eq!(GpuBfsEngine::select_auto_method(&g9, 1), GpuBfsMethod::SparseQueue);
+        assert_eq!(GpuBfsEngine::select_auto_method(&g9, 16), GpuBfsMethod::BitParallel32);
+        assert_eq!(GpuBfsEngine::select_auto_method(&g9, 32), GpuBfsMethod::BitParallel64);
+        assert_eq!(GpuBfsEngine::select_auto_method(&g9, 64), GpuBfsMethod::MultiWordBitParallel);
+    }
+
+    #[test]
+    fn test_select_auto_method_intermediate_degree_graphs() {
+        // 8 < max_degree < 128
+        for &deg in &[9, 16, 32, 33, 50, 64, 100, 127] {
             let g = make_graph_with_max_degree(deg);
             assert_eq!(g.max_degree(), deg);
 
@@ -412,15 +554,7 @@ mod tests {
 
             // 1 < S < 32 -> BitParallel32
             assert_eq!(
-                GpuBfsEngine::select_auto_method(&g, 2),
-                GpuBfsMethod::BitParallel32
-            );
-            assert_eq!(
                 GpuBfsEngine::select_auto_method(&g, 16),
-                GpuBfsMethod::BitParallel32
-            );
-            assert_eq!(
-                GpuBfsEngine::select_auto_method(&g, 31),
                 GpuBfsMethod::BitParallel32
             );
 
@@ -440,65 +574,12 @@ mod tests {
                 GpuBfsMethod::MultiWordBitParallel
             );
             assert_eq!(
-                GpuBfsEngine::select_auto_method(&g, 256),
-                GpuBfsMethod::MultiWordBitParallel
-            );
-            assert_eq!(
                 GpuBfsEngine::select_auto_method(&g, 512),
-                GpuBfsMethod::MultiWordBitParallel
-            );
-            assert_eq!(
-                GpuBfsEngine::select_auto_method(&g, 1024),
                 GpuBfsMethod::MultiWordBitParallel
             );
             assert_eq!(
                 GpuBfsEngine::select_auto_method(&g, 2048),
                 GpuBfsMethod::MultiWordBitParallel
-            );
-        }
-    }
-
-    #[test]
-    fn test_select_auto_method_intermediate_degree_graphs() {
-        // 32 < max_degree < 128
-        for &deg in &[33, 50, 64, 100, 127] {
-            let g = make_graph_with_max_degree(deg);
-            assert_eq!(g.max_degree(), deg);
-
-            // S = 1 -> SparseQueue
-            assert_eq!(
-                GpuBfsEngine::select_auto_method(&g, 1),
-                GpuBfsMethod::SparseQueue
-            );
-
-            // 1 < S < 32 -> BitParallel32
-            assert_eq!(
-                GpuBfsEngine::select_auto_method(&g, 16),
-                GpuBfsMethod::BitParallel32
-            );
-
-            // 32 <= S < 64 -> BitParallel64
-            assert_eq!(
-                GpuBfsEngine::select_auto_method(&g, 32),
-                GpuBfsMethod::BitParallel64
-            );
-            assert_eq!(
-                GpuBfsEngine::select_auto_method(&g, 63),
-                GpuBfsMethod::BitParallel64
-            );
-
-            // S >= 64 -> IndirectSparseQueuePush
-            assert_eq!(
-                GpuBfsEngine::select_auto_method(&g, 64),
-                GpuBfsMethod::IndirectSparseQueuePush
-            );
-            assert_eq!(
-                GpuBfsEngine::select_auto_method(&g, 512),
-                GpuBfsMethod::IndirectSparseQueuePush
-            );
-            assert_eq!(
-                GpuBfsEngine::select_auto_method(&g, 2048),
-                GpuBfsMethod::IndirectSparseQueuePush
             );
         }
     }

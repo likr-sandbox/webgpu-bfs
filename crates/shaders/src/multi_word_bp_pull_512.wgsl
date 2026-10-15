@@ -16,9 +16,9 @@ struct Params {
     current_level: u32,
     total_sources: u32,
     dispatch_x: u32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
+    bank_shift: u32,
+    bank_mask: u32,
+    pad0: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -39,67 +39,30 @@ struct Params {
 @group(0) @binding(13) var<storage, read_write> dist_bank6: array<u32>;
 @group(0) @binding(14) var<storage, read_write> dist_bank7: array<u32>;
 
-fn write_bank_bits(bank: u32, k: u32, mut_bits: u32, v: u32, nv: u32, cur_level: u32) {
-    let w_offset = (k & 1u) * 32u;
+fn write_bank_bits(k: u32, mut_bits: u32, v: u32, nv: u32, cur_level: u32) {
+    let s_base = k * 32u;
+    let is_configured = params.pad0 == 1u || params.bank_shift > 0u;
+    let b_shift = select(6u, params.bank_shift, is_configured);
+    let b_mask = select(63u, params.bank_mask, is_configured);
     var bits = mut_bits;
-    switch (bank) {
-        case 0u: {
-            while (bits != 0u) {
-                let bit_pos = countTrailingZeros(bits);
-                dist_bank0[(w_offset + bit_pos) * nv + v] = cur_level;
-                bits = bits & (bits - 1u);
-            }
+    while (bits != 0u) {
+        let bit_pos = countTrailingZeros(bits);
+        bits = bits & (bits - 1u);
+        let s_pass = s_base + bit_pos;
+        let bank = s_pass >> b_shift;
+        let s_in_bank = s_pass & b_mask;
+        let idx = s_in_bank * nv + v;
+        switch (bank) {
+            case 0u: { dist_bank0[idx] = cur_level; }
+            case 1u: { dist_bank1[idx] = cur_level; }
+            case 2u: { dist_bank2[idx] = cur_level; }
+            case 3u: { dist_bank3[idx] = cur_level; }
+            case 4u: { dist_bank4[idx] = cur_level; }
+            case 5u: { dist_bank5[idx] = cur_level; }
+            case 6u: { dist_bank6[idx] = cur_level; }
+            case 7u: { dist_bank7[idx] = cur_level; }
+            default: {}
         }
-        case 1u: {
-            while (bits != 0u) {
-                let bit_pos = countTrailingZeros(bits);
-                dist_bank1[(w_offset + bit_pos) * nv + v] = cur_level;
-                bits = bits & (bits - 1u);
-            }
-        }
-        case 2u: {
-            while (bits != 0u) {
-                let bit_pos = countTrailingZeros(bits);
-                dist_bank2[(w_offset + bit_pos) * nv + v] = cur_level;
-                bits = bits & (bits - 1u);
-            }
-        }
-        case 3u: {
-            while (bits != 0u) {
-                let bit_pos = countTrailingZeros(bits);
-                dist_bank3[(w_offset + bit_pos) * nv + v] = cur_level;
-                bits = bits & (bits - 1u);
-            }
-        }
-        case 4u: {
-            while (bits != 0u) {
-                let bit_pos = countTrailingZeros(bits);
-                dist_bank4[(w_offset + bit_pos) * nv + v] = cur_level;
-                bits = bits & (bits - 1u);
-            }
-        }
-        case 5u: {
-            while (bits != 0u) {
-                let bit_pos = countTrailingZeros(bits);
-                dist_bank5[(w_offset + bit_pos) * nv + v] = cur_level;
-                bits = bits & (bits - 1u);
-            }
-        }
-        case 6u: {
-            while (bits != 0u) {
-                let bit_pos = countTrailingZeros(bits);
-                dist_bank6[(w_offset + bit_pos) * nv + v] = cur_level;
-                bits = bits & (bits - 1u);
-            }
-        }
-        case 7u: {
-            while (bits != 0u) {
-                let bit_pos = countTrailingZeros(bits);
-                dist_bank7[(w_offset + bit_pos) * nv + v] = cur_level;
-                bits = bits & (bits - 1u);
-            }
-        }
-        default: {}
     }
 }
 
@@ -157,7 +120,7 @@ fn main(
                     visited[state_idx] = vis | newly;
                     next_frontier[state_idx] = newly;
 
-                    write_bank_bits(k >> 1u, k, newly, v, params.num_vertices, params.current_level + 1u);
+                    write_bank_bits(k, newly, v, params.num_vertices, params.current_level + 1u);
 
                     thread_new_count = thread_new_count + countOneBits(newly);
                 } else {

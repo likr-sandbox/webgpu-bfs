@@ -433,9 +433,13 @@ impl GpuContext {
         }
         let max_by_binding = self.max_storage_buffer_binding_size() / bytes_per_source;
         let max_by_buf = self.max_buffer_size() / bytes_per_source;
-        let max_sources = max_by_binding.min(max_by_buf) as usize;
+        let max_sources = (max_by_binding.min(max_by_buf) as usize).min(2048);
         let aligned = (max_sources / 32) * 32;
-        aligned.max(32)
+        if aligned > 0 {
+            aligned
+        } else {
+            max_sources.max(1)
+        }
     }
 
     /// Creates a GPU storage buffer initialized with host data.

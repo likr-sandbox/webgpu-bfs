@@ -434,6 +434,217 @@ impl CscGraph {
     }
 }
 
+/// Compact, high-throughput reachability bitmask representing reachability from
+/// multiple sources to all graph vertices.
+///
+/// Organized in vertex-major order for zero-copy direct DMA compatibility with
+/// WebGPU bit-parallel kernels:
+/// `word = words[v * words_per_vertex + (s / 32)]`
+/// `is_reachable = (word & (1 << (s % 32))) != 0`
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ReachabilityBitmask {
+    pub num_vertices: usize,
+    pub num_sources: usize,
+    pub words_per_vertex: usize,
+    pub words: Vec<u32>,
+}
+
+impl ReachabilityBitmask {
+    /// Creates a new `ReachabilityBitmask` from pre-allocated word buffer.
+    pub fn new(num_vertices: usize, num_sources: usize, words: Vec<u32>) -> Self {
+        let words_per_vertex = if num_sources == 0 { 0 } else { (num_sources + 31) / 32 };
+        assert_eq!(
+            words.len(),
+            num_vertices * words_per_vertex,
+            "Words buffer length must exactly equal num_vertices * words_per_vertex"
+        );
+        Self {
+            num_vertices,
+            num_sources,
+            words_per_vertex,
+            words,
+        }
+    }
+
+    /// Allocates an empty (all unreachable) bitmask.
+    pub fn zeroed(num_vertices: usize, num_sources: usize) -> Self {
+        let words_per_vertex = if num_sources == 0 { 0 } else { (num_sources + 31) / 32 };
+        Self {
+            num_vertices,
+            num_sources,
+            words_per_vertex,
+            words: vec![0u32; num_vertices * words_per_vertex],
+        }
+    }
+
+    #[inline]
+    pub fn num_vertices(&self) -> usize {
+        self.num_vertices
+    }
+
+    #[inline]
+    pub fn num_sources(&self) -> usize {
+        self.num_sources
+    }
+
+    #[inline]
+    pub fn words_per_vertex(&self) -> usize {
+        self.words_per_vertex
+    }
+
+    /// Returns whether vertex `v` is reachable from source index `s_idx` (0-based in `0..num_sources`).
+    #[inline]
+    pub fn is_reachable(&self, s_idx: usize, v: usize) -> bool {
+        if s_idx >= self.num_sources || v >= self.num_vertices || self.words_per_vertex == 0 {
+            return false;
+        }
+        let w = s_idx / 32;
+        let bit = 1u32 << (s_idx % 32);
+        (self.words[v * self.words_per_vertex + w] & bit) != 0
+    }
+
+    /// Sets the reachability bit for source `s_idx` to vertex `v`.
+    #[inline]
+    pub fn set_reachable(&mut self, s_idx: usize, v: usize) {
+        if s_idx < self.num_sources && v < self.num_vertices && self.words_per_vertex > 0 {
+            let w = s_idx / 32;
+            let bit = 1u32 << (s_idx % 32);
+            self.words[v * self.words_per_vertex + w] |= bit;
+        }
+    }
+
+    /// Returns a slice of the 32-bit reachability words for vertex `v`.
+    #[inline]
+    pub fn vertex_words(&self, v: usize) -> &[u32] {
+        if v >= self.num_vertices || self.words_per_vertex == 0 {
+            return &[];
+        }
+        let start = v * self.words_per_vertex;
+        &self.words[start..start + self.words_per_vertex]
+    }
+
+    /// Returns the number of sources that can reach vertex `v`.
+    #[inline]
+    pub fn reachable_source_count(&self, v: usize) -> usize {
+        let words = self.vertex_words(v);
+        let rem = self.num_sources % 32;
+        if rem == 0 || words.is_empty() {
+            words.iter().map(|&w| w.count_ones() as usize).sum()
+        } else {
+            let last_idx = words.len() - 1;
+            let full_count: usize = words[..last_idx].iter().map(|&w| w.count_ones() as usize).sum();
+            let mask = (1u32 << rem) - 1;
+            full_count + (words[last_idx] & mask).count_ones() as usize
+        }
+    }
+
+    /// Returns total reachable pairs across all sources and vertices.
+    pub fn total_reachable_pairs(&self) -> u64 {
+        (0..self.num_vertices)
+            .map(|v| self.reachable_source_count(v) as u64)
+            .sum()
+    }
+
+    /// Raw word slice (length: `num_vertices * words_per_vertex`).
+    pub fn as_words(&self) -> &[u32] {
+        &self.words
+    }
+
+    /// Mutable raw word slice.
+    pub fn as_words_mut(&mut self) -> &mut [u32] {
+        &mut self.words
+    }
+
+    /// Direct byte slice for zero-copy PCIe / DMA mapping.
+    pub fn as_bytes(&self) -> &[u8] {
+        let byte_len = self.words.len() * std::mem::size_of::<u32>();
+        unsafe { std::slice::from_raw_parts(self.words.as_ptr() as *const u8, byte_len) }
+    }
+
+    /// Constructs the ground-truth ReachabilityBitmask from a canonical distance array.
+    ///
+    /// Canonical distance invariant: `dist[s_idx * num_vertices + v] != u32::MAX <==> reachable`.
+    ///
+    /// Cache-optimized: inverts the loop order to stream contiguous vertex chunks in L2 cache,
+    /// writing full 32-bit words without read-modify-write stalls, parallelized with Rayon on native targets.
+    pub fn from_canonical_distances(
+        num_vertices: usize,
+        num_sources: usize,
+        distances: &[u32],
+    ) -> Self {
+        let mut bitmask = Self::zeroed(num_vertices, num_sources);
+        if num_sources == 0 || num_vertices == 0 {
+            return bitmask;
+        }
+        let wpv = bitmask.words_per_vertex;
+        assert!(
+            distances.len() >= num_sources * num_vertices,
+            "Distances buffer length {} is smaller than required {}",
+            distances.len(),
+            num_sources * num_vertices
+        );
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use rayon::prelude::*;
+            const CHUNK_SIZE: usize = 1024;
+            bitmask
+                .words
+                .par_chunks_mut(CHUNK_SIZE * wpv)
+                .enumerate()
+                .for_each(|(chunk_idx, chunk_words)| {
+                    let v_start = chunk_idx * CHUNK_SIZE;
+                    let v_count = chunk_words.len() / wpv;
+
+                    for w in 0..wpv {
+                        let s_start = w * 32;
+                        let s_count = (num_sources - s_start).min(32);
+                        let mut s_offsets = [0usize; 32];
+                        for b in 0..s_count {
+                            s_offsets[b] = (s_start + b) * num_vertices;
+                        }
+
+                        for local_v in 0..v_count {
+                            let v = v_start + local_v;
+                            let mut word = 0u32;
+                            for b in 0..s_count {
+                                if distances[s_offsets[b] + v] != u32::MAX {
+                                    word |= 1u32 << b;
+                                }
+                            }
+                            chunk_words[local_v * wpv + w] = word;
+                        }
+                    }
+                });
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            for w in 0..wpv {
+                let s_start = w * 32;
+                let s_count = (num_sources - s_start).min(32);
+                let mut s_offsets = [0usize; 32];
+                for b in 0..s_count {
+                    s_offsets[b] = (s_start + b) * num_vertices;
+                }
+
+                for v in 0..num_vertices {
+                    let mut word = 0u32;
+                    for b in 0..s_count {
+                        if distances[s_offsets[b] + v] != u32::MAX {
+                            word |= 1u32 << b;
+                        }
+                    }
+                    bitmask.words[v * wpv + w] = word;
+                }
+            }
+        }
+
+        bitmask
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,5 +755,44 @@ mod tests {
         assert_eq!(isolated.row_offsets, vec![0; 6]);
         assert_eq!(isolated.max_degree(), 0);
         assert!(isolated.validate().is_ok());
+    }
+
+    #[test]
+    fn test_reachability_bitmask_operations() {
+        let nv = 5;
+        let ns = 70; // Spans 3 words (32 + 32 + 6)
+        let mut mask = ReachabilityBitmask::zeroed(nv, ns);
+        assert_eq!(mask.words_per_vertex(), 3);
+        assert_eq!(mask.words.len(), 15);
+
+        // Initially zero
+        assert!(!mask.is_reachable(0, 0));
+        assert_eq!(mask.total_reachable_pairs(), 0);
+
+        // Set reachability
+        mask.set_reachable(0, 0); // word 0 bit 0
+        mask.set_reachable(33, 0); // word 1 bit 1
+        mask.set_reachable(69, 4); // word 2 bit 5
+
+        assert!(mask.is_reachable(0, 0));
+        assert!(mask.is_reachable(33, 0));
+        assert!(!mask.is_reachable(32, 0));
+        assert!(mask.is_reachable(69, 4));
+        assert!(!mask.is_reachable(69, 0));
+
+        assert_eq!(mask.reachable_source_count(0), 2);
+        assert_eq!(mask.reachable_source_count(4), 1);
+        assert_eq!(mask.reachable_source_count(1), 0);
+        assert_eq!(mask.total_reachable_pairs(), 3);
+
+        // Canonical distance conversion test
+        let mut dists = vec![u32::MAX; ns * nv];
+        dists[0] = 0;
+        dists[33 * nv] = 2;
+        dists[69 * nv + 4] = 5;
+
+        let from_dist = ReachabilityBitmask::from_canonical_distances(nv, ns, &dists);
+        assert_eq!(mask, from_dist);
+        assert_eq!(from_dist.as_bytes().len(), 15 * 4);
     }
 }

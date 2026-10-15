@@ -46,8 +46,10 @@ fn main(
         atomicOr(&frontiers[v_base + word_idx], mask);
         atomicOr(&visited[v_base + word_idx], mask);
 
-        let bank = word_idx >> 1u;
-        let local_s = (word_idx & 1u) * 32u + bit_idx;
+        let b_shift = select(6u, params.pad0 & 0xFFu, (params.pad0 & 0x100u) != 0u || params.pad0 > 0u);
+        let b_mask = (1u << b_shift) - 1u;
+        let bank = s >> b_shift;
+        let local_s = s & b_mask;
         let dist_idx = local_s * nv + src;
 
         switch (bank) {

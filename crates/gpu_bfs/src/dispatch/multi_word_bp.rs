@@ -9,14 +9,14 @@
 
 use anyhow::{Context, Result};
 use std::sync::Arc;
-use webgpu_bfs_core::CsrGraph;
+use webgpu_bfs_core::{CsrGraph, ReachabilityBitmask};
 
 use crate::{
     buffer::{read_buffer_u32_blocking, PushPullGraphBuffers},
     context::GpuContext,
-    dispatch::{
-        bit_parallel_64_pull::run_bit_parallel_64_pull,
-        indirect_sparse_push::{unpack_u16_words_to_u32, InitSourcesParams, PackParams, ResetParams},
+    dispatch::indirect_sparse_push::{
+        calculate_bank_shift_and_mask, calculate_bank_sources, unpack_u16_words_to_u32,
+        InitSourcesParams, PackParams, ResetParams,
     },
     pipeline::PipelineCache,
 };
@@ -33,7 +33,9 @@ pub struct MultiWordBpParams {
     pub current_level: u32,
     pub total_sources: u32,
     pub dispatch_x: u32,
-    pub _padding: [u32; 3],
+    pub bank_shift: u32,
+    pub bank_mask: u32,
+    pub pad0: u32,
 }
 
 /// Dynamically selects the word count K in {8, 16, 32, 64} for a given source count.
@@ -91,6 +93,7 @@ pub fn determine_macro_chunk_size(
 pub struct PersistentPullBuffers512 {
     pub num_vertices: usize,
     pub num_edges: usize,
+    pub bank_sources: usize,
 
     pub csc_col_offsets: Arc<wgpu::Buffer>,
     pub csc_row_indices: Arc<wgpu::Buffer>,
@@ -98,6 +101,7 @@ pub struct PersistentPullBuffers512 {
     pub frontier_buf_a: wgpu::Buffer,
     pub frontier_buf_b: wgpu::Buffer,
     pub visited_buf: wgpu::Buffer,
+    pub staging_visited_buf: wgpu::Buffer,
 
     pub dist_banks: [wgpu::Buffer; 8],
     pub packed_u16_banks: [wgpu::Buffer; 8],
@@ -130,7 +134,7 @@ impl PersistentPullBuffers512 {
         let num_edges = graph.num_edges;
 
         // 1. Upload graph topology (CSC col_offsets and row_indices for Pull traversal)
-        let graph_buffers = PushPullGraphBuffers::from_graph(ctx, graph);
+        let graph_buffers = PushPullGraphBuffers::from_symmetric_graph(ctx, graph);
         let csc_col_offsets = graph_buffers.csc_col_offsets;
         let csc_row_indices = graph_buffers.csc_row_indices;
 
@@ -155,12 +159,22 @@ impl PersistentPullBuffers512 {
         let visited_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Pull512 Visited"),
             size: state_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
-        // 3. Multi-bank distance buffers: 8 banks of 64 sources
-        let bank_words = 64 * num_vertices;
+        let staging_visited_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Pull512 Staging Visited"),
+            size: state_bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // 3. Multi-bank distance buffers: 8 banks of scaled sources (obeying 128 MB limit)
+        let bank_sources = calculate_bank_sources(num_vertices);
+        let bank_words = bank_sources * num_vertices;
         let bank_bytes = ((bank_words * std::mem::size_of::<u32>()) as u64).max(4);
         let dist_banks: [wgpu::Buffer; 8] = std::array::from_fn(|i| {
             device.create_buffer(&wgpu::BufferDescriptor {
@@ -492,11 +506,13 @@ impl PersistentPullBuffers512 {
         Self {
             num_vertices,
             num_edges,
+            bank_sources,
             csc_col_offsets,
             csc_row_indices,
             frontier_buf_a,
             frontier_buf_b,
             visited_buf,
+            staging_visited_buf,
             dist_banks,
             packed_u16_banks,
             staging_packed_buf,
@@ -582,13 +598,6 @@ pub fn run_multi_word_bp_into(
         total_elements
     );
 
-    // Fast path: For S <= 64, route to BitParallel64Pull which preserves <= 233 ms latency
-    if num_sources <= 64 {
-        let res = run_bit_parallel_64_pull(ctx, pipelines, graph, sources)?;
-        result[..total_elements].copy_from_slice(&res);
-        return Ok(());
-    }
-
     // Fallback: If hardware cannot bind 15 storage buffers, use legacy multi_word_bp
     if ctx.device().limits().max_storage_buffers_per_shader_stage < 15 {
         let res = run_multi_word_bp_legacy(ctx, pipelines, graph, sources)?;
@@ -649,11 +658,12 @@ fn run_multi_word_bp_512_chunk(
     if active_sources == 0 {
         return Ok(());
     }
-    let num_banks = (active_sources + 63) / 64;
+    let bank_sources = bufs.bank_sources;
+    let num_banks = (active_sources + bank_sources - 1) / bank_sources;
 
     queue.write_buffer(&bufs.sources_buf, 0, bytemuck::cast_slice(chunk_sources));
 
-    let bank_words = (64 * nv) as usize;
+    let bank_words = bank_sources * (nv as usize);
     let total_reset_wgs = ((bank_words + 255) / 256) as u32;
     let (reset_dx, reset_dy) = if total_reset_wgs <= 65535 {
         (total_reset_wgs.max(1), 1u32)
@@ -664,16 +674,21 @@ fn run_multi_word_bp_512_chunk(
     };
 
     let reset_p = ResetParams {
-        total_elements: bank_words as u32,
+        total_elements: if num_banks == 1 {
+            (active_sources * (nv as usize)) as u32
+        } else {
+            bank_words as u32
+        },
         dispatch_x: reset_dx,
     };
     queue.write_buffer(&bufs.reset_params_buf, 0, bytemuck::bytes_of(&reset_p));
 
+    let (bank_shift, bank_mask) = calculate_bank_shift_and_mask(nv as usize);
     let init_src_p = InitSourcesParams {
         num_vertices: nv,
         num_sources: active_sources as u32,
         chunk_start: 0,
-        pad0: 0,
+        pad0: 0x100 | bank_shift,
     };
     queue.write_buffer(&bufs.init_sources_params_buf, 0, bytemuck::bytes_of(&init_src_p));
 
@@ -724,16 +739,17 @@ fn run_multi_word_bp_512_chunk(
                 current_level: level + k as u32,
                 total_sources: active_sources as u32,
                 dispatch_x,
-                _padding: [0; 3],
+                bank_shift,
+                bank_mask,
+                pad0: 1,
             };
             queue.write_buffer(&bufs.params_bufs[k], 0, bytemuck::bytes_of(&p));
         }
         let last_k = chunk_len_steps - 1;
-        queue.write_buffer(&bufs.counter_bufs[last_k], 0, bytemuck::bytes_of(&0u32));
-
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Pull512 Hop Batch Encoder"),
         });
+        encoder.clear_buffer(&bufs.counter_bufs[last_k], 0, Some(4));
 
         if level == 0 {
             encoder.clear_buffer(&bufs.frontier_buf_a, 0, None);
@@ -883,7 +899,7 @@ fn execute_pull_readback_512(
     #[cfg(not(target_arch = "wasm32"))]
     std::thread::scope(|s| {
         for (dst_bank, src_bank) in active_dst
-            .chunks_mut(64 * nv)
+            .chunks_mut(bufs.bank_sources * nv)
             .zip(packed_data[..num_banks * words_per_bank].chunks(words_per_bank))
         {
             s.spawn(move || {
@@ -895,7 +911,7 @@ fn execute_pull_readback_512(
 
     #[cfg(target_arch = "wasm32")]
     for (dst_bank, src_bank) in active_dst
-        .chunks_mut(64 * nv)
+        .chunks_mut(bufs.bank_sources * nv)
         .zip(packed_data[..num_banks * words_per_bank].chunks(words_per_bank))
     {
         let needed_words = (dst_bank.len() + 1) / 2;
@@ -1136,7 +1152,9 @@ fn run_multi_word_bp_legacy(
                     current_level: level + k as u32,
                     total_sources: chunk_len as u32,
                     dispatch_x,
-                    _padding: [0; 3],
+                    bank_shift: 0,
+                    bank_mask: 0,
+                    pad0: 0,
                 };
                 queue.write_buffer(&params_bufs[k], 0, bytemuck::bytes_of(&p));
             }
@@ -1194,4 +1212,295 @@ fn run_multi_word_bp_legacy(
     }
 
     Ok(result)
+}
+
+/// Executes Multi-Source Reachability query using MultiWordBitParallel Pull traversal.
+pub fn run_multi_word_bp_reachability_pooled(
+    ctx: &GpuContext,
+    pipelines: &PipelineCache,
+    graph: &CsrGraph,
+    sources: &[u32],
+    pool: &mut Option<PersistentPullBuffers512>,
+) -> Result<ReachabilityBitmask> {
+    let num_sources = sources.len();
+    let num_vertices = graph.num_vertices;
+    if num_sources == 0 || num_vertices == 0 {
+        return Ok(ReachabilityBitmask::zeroed(num_vertices, num_sources));
+    }
+
+    let needs_alloc = match pool.as_ref() {
+        Some(cached) => {
+            cached.num_vertices != num_vertices || cached.num_edges != graph.num_edges
+        }
+        None => true,
+    };
+    if needs_alloc {
+        *pool = Some(PersistentPullBuffers512::new(ctx, pipelines, graph));
+    }
+    let bufs = pool.as_mut().unwrap();
+
+    let mut bitmask = ReachabilityBitmask::zeroed(num_vertices, num_sources);
+    let nv = num_vertices as u32;
+
+    for (chunk_idx, chunk_sources) in sources.chunks(512).enumerate() {
+        let chunk_start = chunk_idx * 512;
+        run_multi_word_bp_reachability_chunk(
+            ctx,
+            pipelines,
+            bufs,
+            chunk_sources,
+            nv,
+            chunk_start,
+            &mut bitmask,
+        )?;
+    }
+
+    Ok(bitmask)
+}
+
+pub fn run_multi_word_bp_reachability(
+    ctx: &GpuContext,
+    pipelines: &PipelineCache,
+    graph: &CsrGraph,
+    sources: &[u32],
+) -> Result<ReachabilityBitmask> {
+    let mut pool = None;
+    run_multi_word_bp_reachability_pooled(ctx, pipelines, graph, sources, &mut pool)
+}
+
+fn run_multi_word_bp_reachability_chunk(
+    ctx: &GpuContext,
+    pipelines: &PipelineCache,
+    bufs: &PersistentPullBuffers512,
+    chunk_sources: &[u32],
+    nv: u32,
+    chunk_start: usize,
+    bitmask: &mut ReachabilityBitmask,
+) -> Result<()> {
+    let device = ctx.device();
+    let queue = ctx.queue();
+    let active_sources = chunk_sources.len();
+    if active_sources == 0 {
+        return Ok(());
+    }
+    let bank_sources = bufs.bank_sources;
+    let num_banks = (active_sources + bank_sources - 1) / bank_sources;
+
+    queue.write_buffer(&bufs.sources_buf, 0, bytemuck::cast_slice(chunk_sources));
+
+    let bank_words = bank_sources * (nv as usize);
+    let total_reset_wgs = ((bank_words + 255) / 256) as u32;
+    let (reset_dx, reset_dy) = if total_reset_wgs <= 65535 {
+        (total_reset_wgs.max(1), 1u32)
+    } else {
+        let dx = 256u32;
+        let dy = (total_reset_wgs + dx - 1) / dx;
+        (dx, dy)
+    };
+
+    let reset_p = ResetParams {
+        total_elements: if num_banks == 1 {
+            (active_sources * (nv as usize)) as u32
+        } else {
+            bank_words as u32
+        },
+        dispatch_x: reset_dx,
+    };
+    queue.write_buffer(&bufs.reset_params_buf, 0, bytemuck::bytes_of(&reset_p));
+
+    let (bank_shift, bank_mask) = calculate_bank_shift_and_mask(nv as usize);
+    let init_src_p = InitSourcesParams {
+        num_vertices: nv,
+        num_sources: active_sources as u32,
+        chunk_start: 0,
+        pad0: 0x100 | bank_shift,
+    };
+    queue.write_buffer(&bufs.init_sources_params_buf, 0, bytemuck::bytes_of(&init_src_p));
+
+    let total_wgs = (nv + 7) / 8;
+    let (dispatch_x, dispatch_y) = if total_wgs <= 65535 {
+        (total_wgs.max(1), 1u32)
+    } else {
+        let dx = 256u32;
+        let dy = (total_wgs + dx - 1) / dx;
+        (dx, dy)
+    };
+
+    let compute_pipeline = pipelines.multi_word_bp_pull_512_pipeline();
+
+    let mut level = 0u32;
+    let mut cur_chunk_steps = 4usize;
+
+    while level <= nv {
+        let chunk_len_steps = cur_chunk_steps
+            .min(MAX_CHUNK_STEPS)
+            .min((nv - level + 1) as usize);
+        if chunk_len_steps == 0 {
+            break;
+        }
+
+        for k in 0..chunk_len_steps {
+            let p = MultiWordBpParams {
+                num_vertices: nv,
+                words_per_vertex: 16,
+                current_level: level + k as u32,
+                total_sources: active_sources as u32,
+                dispatch_x,
+                bank_shift,
+                bank_mask,
+                pad0: 1,
+            };
+            queue.write_buffer(&bufs.params_bufs[k], 0, bytemuck::bytes_of(&p));
+        }
+        let last_k = chunk_len_steps - 1;
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Pull512 Reachability Hop Batch Encoder"),
+        });
+        encoder.clear_buffer(&bufs.counter_bufs[last_k], 0, Some(4));
+
+        if level == 0 {
+            encoder.clear_buffer(&bufs.frontier_buf_a, 0, None);
+            encoder.clear_buffer(&bufs.frontier_buf_b, 0, None);
+            encoder.clear_buffer(&bufs.visited_buf, 0, None);
+
+            for b in 0..num_banks {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Pull512 Reset Distance Bank Pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(pipelines.reset_dist_pipeline());
+                pass.set_bind_group(0, &bufs.reset_dist_bgs[b], &[]);
+                pass.dispatch_workgroups(reset_dx, reset_dy, 1);
+            }
+
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Pull512 Init Sources Pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(pipelines.init_sparse_sources_512_pipeline());
+                pass.set_bind_group(0, &bufs.init_sources_bg, &[]);
+                let init_wgs = ((active_sources as u32 + 255) / 256).max(1);
+                pass.dispatch_workgroups(init_wgs, 1, 1);
+            }
+        }
+
+        for k in 0..chunk_len_steps {
+            let cur_step = level + k as u32;
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(compute_pipeline);
+            let bg = if cur_step % 2 == 0 {
+                &bufs.bgs_even[k]
+            } else {
+                &bufs.bgs_odd[k]
+            };
+            pass.set_bind_group(0, bg, &[]);
+            pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+        }
+
+        encoder.copy_buffer_to_buffer(
+            &bufs.counter_bufs[last_k],
+            0,
+            &bufs.staging_counter_buf,
+            0,
+            4,
+        );
+
+        queue.submit(Some(encoder.finish()));
+
+        let count = read_buffer_u32_blocking(device, &bufs.staging_counter_buf, 1)?[0];
+        if count == 0 {
+            break;
+        }
+
+        level += chunk_len_steps as u32;
+        cur_chunk_steps = (cur_chunk_steps * 2).min(MAX_CHUNK_STEPS);
+    }
+
+    let visited_bytes = (nv as u64) * 16 * 4;
+    let mut read_enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("Pull512 Visited Readback Encoder"),
+    });
+    read_enc.copy_buffer_to_buffer(
+        &bufs.visited_buf,
+        0,
+        &bufs.staging_visited_buf,
+        0,
+        visited_bytes,
+    );
+    queue.submit(Some(read_enc.finish()));
+
+    let slice = bufs.staging_visited_buf.slice(..visited_bytes);
+    let (tx, rx) = futures_channel::oneshot::channel();
+    slice.map_async(wgpu::MapMode::Read, move |res| {
+        let _ = tx.send(res);
+    });
+
+    #[cfg(not(target_arch = "wasm32"))]
+    device.poll(wgpu::Maintain::Wait);
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pollster::block_on(rx)
+        .context("Staging visited buffer receiver dropped")?
+        .context("Failed to map staging visited buffer")?;
+
+    let view = slice.get_mapped_range();
+    let visited_slice: &[u32] = bytemuck::cast_slice(&view);
+
+    unpack_pull_reachability(visited_slice, chunk_start, active_sources, nv as usize, bitmask);
+
+    drop(view);
+    bufs.staging_visited_buf.unmap();
+    Ok(())
+}
+
+fn unpack_pull_reachability(
+    visited_slice: &[u32],
+    chunk_start: usize,
+    active_sources: usize,
+    _num_vertices: usize,
+    bitmask: &mut ReachabilityBitmask,
+) {
+    let dst_wpv = bitmask.words_per_vertex;
+    let src_wpv = 16;
+    let start_word = chunk_start / 32;
+    let num_chunk_words = (active_sources + 31) / 32;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rayon::prelude::*;
+        bitmask
+            .words
+            .par_chunks_mut(dst_wpv)
+            .enumerate()
+            .for_each(|(v, v_words)| {
+                for k in 0..num_chunk_words {
+                    let mask = if (k + 1) * 32 <= active_sources {
+                        !0u32
+                    } else {
+                        let rem = active_sources - k * 32;
+                        (1u32 << rem) - 1
+                    };
+                    v_words[start_word + k] |= visited_slice[v * src_wpv + k] & mask;
+                }
+            });
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        for (v, v_words) in bitmask.words.chunks_mut(dst_wpv).enumerate() {
+            for k in 0..num_chunk_words {
+                let mask = if (k + 1) * 32 <= active_sources {
+                    !0u32
+                } else {
+                    let rem = active_sources - k * 32;
+                    (1u32 << rem) - 1
+                };
+                v_words[start_word + k] |= visited_slice[v * src_wpv + k] & mask;
+            }
+        }
+    }
 }

@@ -75,23 +75,23 @@ fn test_auto_routing_heuristic() {
     assert_eq!(grid.graph.max_degree(), 4);
     assert_eq!(
         GpuBfsEngine::select_auto_method(&grid.graph, 64),
-        GpuBfsMethod::MultiWordBitParallel
+        GpuBfsMethod::WorkgroupPersistentBfs
     );
     assert_eq!(
         GpuBfsEngine::select_auto_method(&grid.graph, 512),
-        GpuBfsMethod::MultiWordBitParallel
+        GpuBfsMethod::WorkgroupPersistentBfs
     );
     assert_eq!(
         GpuBfsEngine::select_auto_method(&grid.graph, 32),
-        GpuBfsMethod::BitParallel64
+        GpuBfsMethod::WorkgroupPersistentBfs
     );
     assert_eq!(
         GpuBfsEngine::select_auto_method(&grid.graph, 16),
-        GpuBfsMethod::BitParallel32
+        GpuBfsMethod::WorkgroupPersistentBfs
     );
     assert_eq!(
         GpuBfsEngine::select_auto_method(&grid.graph, 1),
-        GpuBfsMethod::SparseQueue
+        GpuBfsMethod::WorkgroupPersistentBfs
     );
 
     // 2. Extreme star hub (max degree 599 >= 128)

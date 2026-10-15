@@ -24,7 +24,7 @@ const state = {
   bfsResult: null,
   benchmarkResults: [],
   selectedSources: [0],
-  activeAlgorithm: 'PushPullAdaptive',
+  activeAlgorithm: 'Auto',
   uploadedMtxText: null,
 };
 
@@ -652,6 +652,8 @@ async function runBenchmarkComparison() {
   elements.btnRunBenchmark.disabled = true;
 
   const algorithms = [
+    { id: 'Auto', name: 'Auto (Adaptive Router)', isCpu: false },
+    { id: 'IndirectSparseQueuePush', name: 'Indirect Sparse Push', isCpu: false },
     { id: 'PushPullAdaptive', name: 'Push/Pull (GraphBLAST)', isCpu: false },
     { id: 'BitParallel64', name: 'Bit-Parallel 64', isCpu: false },
     { id: 'BitParallel32', name: 'Bit-Parallel 32', isCpu: false },

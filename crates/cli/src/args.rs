@@ -47,8 +47,12 @@ pub struct RunArgs {
     pub sources: SourceArgs,
 
     /// Algorithmic strategy to execute
-    #[arg(long, short = 'm', value_enum, default_value_t = MethodArg::BitParallel64)]
+    #[arg(long, short = 'm', value_enum, default_value_t = MethodArg::Auto)]
     pub method: MethodArg,
+
+    /// Execute reachability bitmask mode (returns compact reachability bitmask instead of distances)
+    #[arg(long)]
+    pub reachability: bool,
 
     /// Verify distance array against CPU reference implementation (100% parity check)
     #[arg(long)]
@@ -103,6 +107,10 @@ pub struct BenchCommandArgs {
     #[arg(long)]
     pub verify: bool,
 
+    /// Also benchmark reachability bitmask mode
+    #[arg(long)]
+    pub reachability: bool,
+
     /// Max number of discrepancy details to print on verification failure
     #[arg(long, default_value_t = 10)]
     pub max_diffs: usize,
@@ -127,6 +135,10 @@ pub struct VerifyCommandArgs {
     /// Algorithmic strategy to verify (or 'all' to verify all GPU implementations)
     #[arg(long, short = 'm', value_enum, default_value_t = MethodArg::All)]
     pub method: MethodArg,
+
+    /// Verify reachability bitmask mode against CPU reference
+    #[arg(long)]
+    pub reachability: bool,
 
     /// Max number of discrepancy details to print on verification failure
     #[arg(long, default_value_t = 10)]
@@ -324,7 +336,6 @@ pub enum MethodArg {
     )]
     BitParallel32,
 
-    #[default]
     #[value(
         name = "BitParallel64",
         alias = "bit64",
@@ -412,6 +423,15 @@ pub enum MethodArg {
     MultiWordBitParallelPush,
 
     #[value(
+        name = "WorkgroupPersistentBfs",
+        alias = "workgroup-persistent",
+        alias = "persistent-bfs",
+        alias = "wp-bfs",
+        alias = "workgroup-persistent-bfs"
+    )]
+    WorkgroupPersistentBfs,
+
+    #[value(
         name = "CpuReference",
         alias = "cpu",
         alias = "cpu-ref",
@@ -432,6 +452,7 @@ pub enum MethodArg {
     #[value(name = "All", alias = "all")]
     All,
 
+    #[default]
     #[value(
         name = "Auto",
         alias = "auto",

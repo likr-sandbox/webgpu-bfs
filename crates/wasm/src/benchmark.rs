@@ -4,7 +4,7 @@ use wasm_bindgen::prelude::*;
 
 use crate::{
     cpu::run_cpu_bfs,
-    gpu::{run_gpu_bfs, WasmGpuContext},
+    gpu::{run_gpu_bfs, run_gpu_reachability, WasmGpuContext},
     now_ms,
     types::{WasmBfsResult, WasmVerifyResult},
     WasmGraph,
@@ -18,7 +18,7 @@ pub async fn verify_bfs(
     sources: &[u32],
     method: Option<String>,
 ) -> Result<WasmVerifyResult, JsValue> {
-    let method_str = method.as_deref().unwrap_or("BitParallel64");
+    let method_str = method.as_deref().unwrap_or("Auto");
 
     let gpu_res = run_gpu_bfs(ctx, graph, sources, Some(method_str.to_string())).await?;
     let cpu_res = run_cpu_bfs(graph, sources, Some("SequentialFifo".to_string()))?;
@@ -73,6 +73,66 @@ pub async fn verify_bfs(
     ))
 }
 
+/// Verifies exact reachability bitmask equivalence between GPU and CPU BFS.
+#[wasm_bindgen]
+pub async fn verify_reachability(
+    ctx: &WasmGpuContext,
+    graph: &WasmGraph,
+    sources: &[u32],
+) -> Result<WasmVerifyResult, JsValue> {
+    let gpu_res = run_gpu_reachability(ctx, graph, sources).await?;
+    let cpu_res = run_cpu_bfs(graph, sources, Some("SequentialFifo".to_string()))?;
+
+    let nv = graph.num_vertices();
+    let num_sources = sources.len();
+    let total_pairs = num_sources * nv;
+    let mut mismatches = 0;
+    let mut sample_src = None;
+    let mut sample_v = None;
+    let mut sample_g = None;
+    let mut sample_c = None;
+
+    for s_idx in 0..num_sources {
+        for v in 0..nv {
+            let gpu_reachable = gpu_res.is_reachable(s_idx, v as u32);
+            let cpu_reachable = cpu_res.distances[s_idx * nv + v] != u32::MAX;
+            if gpu_reachable != cpu_reachable {
+                if mismatches == 0 {
+                    sample_src = Some(s_idx as u32);
+                    sample_v = Some(v as u32);
+                    sample_g = Some(if gpu_reachable { 1 } else { 0 });
+                    sample_c = Some(if cpu_reachable { 1 } else { 0 });
+                }
+                mismatches += 1;
+            }
+        }
+    }
+
+    let is_eq = mismatches == 0;
+    let msg = if is_eq {
+        format!(
+            "PASS: 100% exact reachability match across all {} source-vertex pairs",
+            total_pairs
+        )
+    } else {
+        format!(
+            "FAIL: {} / {} reachability mismatches detected between GPU and CPU reference",
+            mismatches, total_pairs
+        )
+    };
+
+    Ok(WasmVerifyResult::new(
+        is_eq,
+        total_pairs,
+        mismatches,
+        sample_src,
+        sample_v,
+        sample_g,
+        sample_c,
+        msg,
+    ))
+}
+
 /// Runs a multi-method benchmark comparing algorithms.
 #[wasm_bindgen]
 pub async fn run_benchmark(
@@ -87,6 +147,8 @@ pub async fn run_benchmark(
     let warm = warmup.unwrap_or(1);
 
     let default_methods = vec![
+        "Auto".to_string(),
+        "IndirectSparseQueuePush".to_string(),
         "PushPullAdaptive".to_string(),
         "BitParallel64".to_string(),
         "BitParallel32".to_string(),

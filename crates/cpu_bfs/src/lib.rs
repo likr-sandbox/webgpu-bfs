@@ -12,4 +12,4 @@ pub use bit_parallel::ms_bfs_bit_parallel;
 pub use engine::{CpuBfsAlgorithm, CpuBfsEngine};
 pub use fifo::{bfs_single_source, bfs_single_source_into, ms_bfs_fifo};
 pub use rayon_ms::ms_bfs_rayon;
-pub use webgpu_bfs_core::BfsEngine;
+pub use webgpu_bfs_core::{BfsEngine, ReachabilityBitmask, ReachabilityEngine};

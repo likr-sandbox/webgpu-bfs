@@ -108,6 +108,14 @@ fn test_workgroup_storage_limits() {
                 lds_size
             );
         }
+
+        if *name == "workgroup_persistent_bfs.wgsl" {
+            assert_eq!(
+                lds_size, 16384,
+                "workgroup_persistent_bfs.wgsl LDS size must be exactly 16384 bytes, got {} bytes",
+                lds_size
+            );
+        }
     }
 }
 

@@ -78,4 +78,22 @@ mod tests {
         assert_eq!(graph.num_vertices(), 3);
         assert_eq!(graph.num_edges(), 2);
     }
+
+    #[test]
+    fn test_wasm_reachability_result() {
+        // 2 vertices, 33 sources (2 words per vertex)
+        let words = vec![
+            1 | (1 << 3), // vertex 0: reachable from src 0, 3
+            0,            // vertex 0 word 1
+            0,            // vertex 1 word 0
+            1 << 1,       // vertex 1 word 1: reachable from src 33
+        ];
+        let res = WasmReachabilityResult::new(words, 2, 34, 2, 1.5, 3, "Auto".to_string());
+        assert!(res.is_reachable(0, 0));
+        assert!(res.is_reachable(3, 0));
+        assert!(!res.is_reachable(1, 0));
+        assert!(!res.is_reachable(0, 1));
+        assert!(res.is_reachable(33, 1));
+        assert_eq!(res.method(), "Auto");
+    }
 }

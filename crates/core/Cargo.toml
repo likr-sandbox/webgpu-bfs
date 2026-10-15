@@ -20,3 +20,7 @@ bytemuck = { workspace = true, optional = true }
 default = []
 serde = ["dep:serde"]
 bytemuck = ["dep:bytemuck"]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon = { workspace = true }
+

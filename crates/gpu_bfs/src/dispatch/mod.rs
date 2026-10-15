@@ -13,3 +13,5 @@ pub mod sparse_bp;
 pub mod sparse_queue;
 pub mod indirect_sparse_push;
 pub mod multi_word_push;
+pub mod workgroup_persistent;
+

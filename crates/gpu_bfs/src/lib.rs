@@ -13,3 +13,4 @@ pub use buffer::{read_buffer_u32_blocking, CsrGpuBuffers, DistanceGpuBuffer, Fro
 pub use context::GpuContext;
 pub use engine::{GpuBfsEngine, GpuBfsMethod};
 pub use pipeline::PipelineCache;
+pub use webgpu_bfs_core::{ReachabilityBitmask, ReachabilityEngine};

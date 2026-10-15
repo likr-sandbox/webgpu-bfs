@@ -9,7 +9,10 @@ use wgpu::{Buffer, Device};
 
 use crate::{
     now_ms,
-    types::{calc_mteps, count_traversed_edges, count_visited_vertices, WasmBfsResult},
+    types::{
+        calc_mteps, count_traversed_edges, count_visited_vertices, WasmBfsResult,
+        WasmReachabilityResult,
+    },
     WasmGraph,
 };
 
@@ -137,7 +140,7 @@ pub async fn run_gpu_bfs(
     sources: &[u32],
     method: Option<String>,
 ) -> Result<WasmBfsResult, JsValue> {
-    let method_str = method.as_deref().unwrap_or("BitParallel64");
+    let method_str = method.as_deref().unwrap_or("Auto");
     let t0 = now_ms();
 
     let distances = run_gpu_dispatch_async(ctx, &graph.inner, sources, method_str).await?;
@@ -156,6 +159,46 @@ pub async fn run_gpu_bfs(
         traversed_edges,
         visited_vertices,
         method_str.to_string(),
+    ))
+}
+
+/// Asynchronously runs GPU reachability bitmask computation.
+#[wasm_bindgen]
+pub async fn run_gpu_reachability(
+    ctx: &WasmGpuContext,
+    graph: &WasmGraph,
+    sources: &[u32],
+) -> Result<WasmReachabilityResult, JsValue> {
+    let t0 = now_ms();
+    let distances = run_gpu_dispatch_async(ctx, &graph.inner, sources, "Auto").await?;
+    let elapsed_ms = (now_ms() - t0).max(0.001);
+
+    let num_vertices = graph.num_vertices();
+    let num_sources = sources.len();
+    let words_per_vertex = num_sources.div_ceil(32);
+    let mut words = vec![0u32; num_vertices * words_per_vertex];
+    let mut total_reachable_pairs = 0;
+
+    for s_idx in 0..num_sources {
+        let w = s_idx / 32;
+        let bit = 1u32 << (s_idx % 32);
+        let s_offset = s_idx * num_vertices;
+        for v in 0..num_vertices {
+            if distances[s_offset + v] != u32::MAX {
+                words[v * words_per_vertex + w] |= bit;
+                total_reachable_pairs += 1;
+            }
+        }
+    }
+
+    Ok(WasmReachabilityResult::new(
+        words,
+        num_vertices,
+        num_sources,
+        words_per_vertex,
+        elapsed_ms,
+        total_reachable_pairs,
+        "Auto".to_string(),
     ))
 }
 
@@ -182,6 +225,16 @@ pub async fn run_gpu_dispatch_async(
     }
 
     match method {
+        "Auto" => {
+            if graph.max_degree() <= 32 {
+                async_dispatch_bp64(ctx, graph, sources).await
+            } else {
+                async_dispatch_push_pull(ctx, graph, sources).await
+            }
+        }
+        "IndirectSparseQueuePush" => {
+            async_dispatch_push_pull(ctx, graph, sources).await
+        }
         "BitParallel32" => async_dispatch_bp32(ctx, graph, sources).await,
         "BitParallel64" => async_dispatch_bp64(ctx, graph, sources).await,
         "BooleanReachability" => async_dispatch_bool_reach(ctx, graph, sources).await,

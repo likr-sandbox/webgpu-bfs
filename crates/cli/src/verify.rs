@@ -148,6 +148,76 @@ pub fn verify_engine_output(
     }
 }
 
+pub fn verify_reachability_output(
+    method_name: &str,
+    graph: &CsrGraph,
+    sources: &[u32],
+    gpu_mask: &webgpu_bfs_core::ReachabilityBitmask,
+    cpu_mask: &webgpu_bfs_core::ReachabilityBitmask,
+    max_diffs: usize,
+) -> VerificationResult {
+    let nv = graph.num_vertices;
+    let num_sources = sources.len();
+    let total_elements = num_sources * nv;
+
+    let mut mismatched_elements = 0;
+    let mut diff_samples = Vec::new();
+    let mut self_reach_passed = true;
+
+    for (s_idx, &s_id) in sources.iter().enumerate() {
+        if (s_id as usize) < nv && !gpu_mask.is_reachable(s_idx, s_id as usize) {
+            self_reach_passed = false;
+        }
+
+        for v in 0..nv {
+            let actual = gpu_mask.is_reachable(s_idx, v);
+            let expected = cpu_mask.is_reachable(s_idx, v);
+
+            if actual != expected {
+                mismatched_elements += 1;
+                if diff_samples.len() < max_diffs {
+                    let neighbors = graph.neighbors(v);
+                    let sample: Vec<u32> = neighbors.iter().take(8).copied().collect();
+                    diff_samples.push(DiscrepancyDetail {
+                        flat_index: s_idx * nv + v,
+                        source_index: s_idx,
+                        source_vertex: s_id,
+                        target_vertex: v as u32,
+                        target_degree: neighbors.len(),
+                        expected_dist: expected as u32,
+                        actual_dist: actual as u32,
+                        neighbor_sample: sample,
+                    });
+                }
+            }
+        }
+    }
+
+    let is_valid = mismatched_elements == 0 && self_reach_passed;
+    let message = if is_valid {
+        format!(
+            "PASS: 100% bitwise reachability parity verified ({} source-vertex pairs)",
+            total_elements
+        )
+    } else {
+        format!(
+            "FAIL: {} / {} reachability discrepancies detected in method '{}'",
+            mismatched_elements, total_elements, method_name
+        )
+    };
+
+    VerificationResult {
+        method_name: method_name.to_string(),
+        is_valid,
+        total_elements,
+        mismatched_elements,
+        self_distance_passed: self_reach_passed,
+        triangle_inequality_passed: true,
+        message,
+        diff_samples,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

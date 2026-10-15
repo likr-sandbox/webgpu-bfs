@@ -191,7 +191,9 @@
             <label for="algorithm-select">Execution Algorithm</label>
             <select id="algorithm-select" class="form-control">
               <optgroup label="GPU Compute (WebGPU)">
-                <option value="PushPullAdaptive" selected>Push/Pull Adaptive (GraphBLAST)</option>
+                <option value="Auto" selected>Auto (Topology & Batch-Adaptive Router)</option>
+                <option value="IndirectSparseQueuePush">Indirect Sparse Queue Push (M12/M20/M22)</option>
+                <option value="PushPullAdaptive">Push/Pull Adaptive (GraphBLAST)</option>
                 <option value="BitParallel64">Bit-Parallel 64-source (Packed)</option>
                 <option value="BitParallel32">Bit-Parallel 32-source (Packed)</option>
                 <option value="BooleanReachability">Boolean Reachability (3-Stage)</option>

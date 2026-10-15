@@ -1756,6 +1756,7 @@ dependencies = [
  "bytemuck",
  "rand",
  "rand_chacha",
+ "rayon",
  "serde",
  "thiserror 2.0.21",
 ]
@@ -1781,6 +1782,7 @@ dependencies = [
  "log",
  "pollster",
  "rand",
+ "rayon",
  "thiserror 2.0.21",
  "webgpu-bfs-core",
  "webgpu-bfs-cpu",

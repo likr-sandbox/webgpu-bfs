@@ -1,15 +1,17 @@
 use anyhow::Result;
 use std::sync::Arc;
 use std::time::Instant;
-use webgpu_bfs_core::{BfsEngine, CsrGraph};
+use webgpu_bfs_core::{BfsEngine, CsrGraph, ReachabilityBitmask, ReachabilityEngine};
 use webgpu_bfs_cpu::CpuBfsEngine;
 use webgpu_bfs_gpu::{GpuBfsEngine, GpuBfsMethod, GpuContext};
 
 use crate::args::MethodArg;
-use crate::verify::{verify_engine_output, VerificationResult};
+use crate::verify::{verify_engine_output, verify_reachability_output, VerificationResult};
 
+#[allow(clippy::large_enum_variant)]
 enum BenchEngine {
-    Cpu(Box<dyn BfsEngine>),
+    CpuRayon(CpuBfsEngine),
+    CpuFifo(CpuBfsEngine),
     Gpu(GpuBfsEngine),
 }
 
@@ -51,6 +53,7 @@ pub struct BenchmarkHarness {
     iters: usize,
     verify: bool,
     max_diffs: usize,
+    reachability: bool,
 }
 
 impl BenchmarkHarness {
@@ -62,7 +65,13 @@ impl BenchmarkHarness {
             iters,
             verify,
             max_diffs,
+            reachability: false,
         })
+    }
+
+    pub fn with_reachability(mut self, reachability: bool) -> Self {
+        self.reachability = reachability;
+        self
     }
 
     #[allow(dead_code)]
@@ -95,14 +104,26 @@ impl BenchmarkHarness {
                 MethodArg::IndirectMacroBatch,
                 MethodArg::IndirectSparseQueuePush,
                 MethodArg::MultiWordBitParallelPush,
+                MethodArg::WorkgroupPersistentBfs,
+                MethodArg::Auto,
             ],
             single => vec![single],
         };
 
-        // 1. Calculate ground-truth traversed edges for the batch
+        // 1. Calculate ground-truth traversed edges or reachability bitmask for the batch
         let cpu_engine = CpuBfsEngine::new();
-        let ground_truth_dist = cpu_engine.run_ms_bfs(graph, sources)?;
-        let traversed_edges = calculate_traversed_edges(graph, sources, &ground_truth_dist);
+        let (ground_truth_dist, ground_truth_mask, traversed_edges) = if self.reachability {
+            let mask = if self.verify {
+                Some(cpu_engine.run_reachability(graph, sources)?)
+            } else {
+                None
+            };
+            (Vec::new(), mask, 0)
+        } else {
+            let dist = cpu_engine.run_ms_bfs(graph, sources)?;
+            let edges = calculate_traversed_edges(graph, sources, &dist);
+            (dist, None, edges)
+        };
 
         let mut results = Vec::new();
         let mut baseline_mean_ms = None;
@@ -116,6 +137,7 @@ impl BenchmarkHarness {
                 m,
                 traversed_edges,
                 &ground_truth_dist,
+                ground_truth_mask.as_ref(),
             )?;
             eprintln!("    Completed in {:.2} ms (mean)", res.mean_ms);
 
@@ -157,14 +179,15 @@ impl BenchmarkHarness {
         method: MethodArg,
         traversed_edges: usize,
         ground_truth_dist: &[u32],
+        ground_truth_mask: Option<&ReachabilityBitmask>,
     ) -> Result<BenchmarkResult> {
         let (engine, method_name) = match method {
             MethodArg::CpuReference => (
-                BenchEngine::Cpu(Box::new(CpuBfsEngine::rayon())),
+                BenchEngine::CpuRayon(CpuBfsEngine::rayon()),
                 "CPU Reference (Rayon)".to_string(),
             ),
             MethodArg::CpuSingleThread => (
-                BenchEngine::Cpu(Box::new(CpuBfsEngine::fifo())),
+                BenchEngine::CpuFifo(CpuBfsEngine::fifo()),
                 "CPU Single-Thread (FIFO)".to_string(),
             ),
             MethodArg::NaiveSequential => (
@@ -258,6 +281,13 @@ impl BenchmarkHarness {
                 )?),
                 "GPU MultiWordBitParallelPush".to_string(),
             ),
+            MethodArg::WorkgroupPersistentBfs => (
+                BenchEngine::Gpu(GpuBfsEngine::new(
+                    self.context.clone(),
+                    GpuBfsMethod::WorkgroupPersistentBfs,
+                )?),
+                "GPU WorkgroupPersistentBfs".to_string(),
+            ),
             MethodArg::Auto => (
                 BenchEngine::Gpu(GpuBfsEngine::new(
                     self.context.clone(),
@@ -273,12 +303,29 @@ impl BenchmarkHarness {
 
         // A. Warm-up Phase
         for _ in 0..self.warmup {
-            match &engine {
-                BenchEngine::Cpu(cpu) => {
-                    let _ = cpu.run_ms_bfs(graph, sources)?;
+            if self.reachability {
+                match &engine {
+                    BenchEngine::CpuRayon(cpu) => {
+                        let _ = cpu.run_reachability(graph, sources)?;
+                    }
+                    BenchEngine::CpuFifo(cpu) => {
+                        let _ = cpu.run_reachability(graph, sources)?;
+                    }
+                    BenchEngine::Gpu(gpu) => {
+                        let _ = gpu.run_reachability(graph, sources)?;
+                    }
                 }
-                BenchEngine::Gpu(gpu) => {
-                    gpu.run_ms_bfs_into(graph, sources, &mut reusable_output)?;
+            } else {
+                match &engine {
+                    BenchEngine::CpuRayon(cpu) => {
+                        let _ = cpu.run_ms_bfs(graph, sources)?;
+                    }
+                    BenchEngine::CpuFifo(cpu) => {
+                        let _ = cpu.run_ms_bfs(graph, sources)?;
+                    }
+                    BenchEngine::Gpu(gpu) => {
+                        gpu.run_ms_bfs_into(graph, sources, &mut reusable_output)?;
+                    }
                 }
             }
         }
@@ -286,25 +333,43 @@ impl BenchmarkHarness {
         // B. Timed Measurement Phase
         let mut durations = Vec::with_capacity(self.iters);
         let mut last_output = Vec::new();
+        let mut last_mask: Option<ReachabilityBitmask> = None;
 
         for _ in 0..self.iters {
             let start = Instant::now();
-            match &engine {
-                BenchEngine::Cpu(cpu) => {
-                    let dist = cpu.run_ms_bfs(graph, sources)?;
-                    let elapsed = start.elapsed();
-                    durations.push(elapsed);
-                    last_output = dist;
-                }
-                BenchEngine::Gpu(gpu) => {
-                    gpu.run_ms_bfs_into(graph, sources, &mut reusable_output)?;
-                    let elapsed = start.elapsed();
-                    durations.push(elapsed);
+            if self.reachability {
+                let mask = match &engine {
+                    BenchEngine::CpuRayon(cpu) => cpu.run_reachability(graph, sources)?,
+                    BenchEngine::CpuFifo(cpu) => cpu.run_reachability(graph, sources)?,
+                    BenchEngine::Gpu(gpu) => gpu.run_reachability(graph, sources)?,
+                };
+                let elapsed = start.elapsed();
+                durations.push(elapsed);
+                last_mask = Some(mask);
+            } else {
+                match &engine {
+                    BenchEngine::CpuRayon(cpu) => {
+                        let dist = cpu.run_ms_bfs(graph, sources)?;
+                        let elapsed = start.elapsed();
+                        durations.push(elapsed);
+                        last_output = dist;
+                    }
+                    BenchEngine::CpuFifo(cpu) => {
+                        let dist = cpu.run_ms_bfs(graph, sources)?;
+                        let elapsed = start.elapsed();
+                        durations.push(elapsed);
+                        last_output = dist;
+                    }
+                    BenchEngine::Gpu(gpu) => {
+                        gpu.run_ms_bfs_into(graph, sources, &mut reusable_output)?;
+                        let elapsed = start.elapsed();
+                        durations.push(elapsed);
+                    }
                 }
             }
         }
 
-        if matches!(engine, BenchEngine::Gpu(_)) && self.iters > 0 {
+        if !self.reachability && matches!(engine, BenchEngine::Gpu(_)) && self.iters > 0 {
             last_output = reusable_output;
         }
 
@@ -365,14 +430,27 @@ impl BenchmarkHarness {
 
         // E. Verification Check
         let verification = if self.verify {
-            Some(verify_engine_output(
-                &method_name,
-                graph,
-                sources,
-                &last_output,
-                ground_truth_dist,
-                self.max_diffs,
-            ))
+            if self.reachability {
+                ground_truth_mask.map(|gt| {
+                    verify_reachability_output(
+                        &method_name,
+                        graph,
+                        sources,
+                        last_mask.as_ref().unwrap(),
+                        gt,
+                        self.max_diffs,
+                    )
+                })
+            } else {
+                Some(verify_engine_output(
+                    &method_name,
+                    graph,
+                    sources,
+                    &last_output,
+                    ground_truth_dist,
+                    self.max_diffs,
+                ))
+            }
         } else {
             None
         };

@@ -6,6 +6,10 @@ struct PushUniforms {
     chunk_start: u32,      // Global source offset (e.g. 0, 512...)
     hub_threshold: u32,    // Degree threshold for collaborative workgroup expansion (e.g. 128u or 256u)
     num_words: u32,        // Number of active words (e.g. 16)
+    density_threshold: u32,
+    bank_shift: u32,
+    bank_mask: u32,
+    pad0: u32,
 };
 
 struct IterationState {
@@ -55,67 +59,30 @@ var<workgroup> s_sub_queue_count: array<atomic<u32>, 4>;
 var<workgroup> s_sub_offsets: array<u32, 4>;
 var<workgroup> s_sub_counts: array<u32, 4>;
 
-fn write_bank_bits(bank: u32, w: u32, mut_bits: u32, v: u32, nv: u32, cur_level: u32) {
-    let w_offset = (w & 1u) * 32u;
+fn write_bank_bits(w: u32, mut_bits: u32, v: u32, nv: u32, cur_level: u32) {
+    let s_base = w * 32u;
+    let is_configured = uniforms.pad0 == 1u || uniforms.bank_shift > 0u;
+    let b_shift = select(6u, uniforms.bank_shift, is_configured);
+    let b_mask = select(63u, uniforms.bank_mask, is_configured);
     var bits = mut_bits;
-    switch (bank) {
-        case 0u: {
-            while (bits != 0u) {
-                let bit_pos = countTrailingZeros(bits);
-                dist_bank0[(w_offset + bit_pos) * nv + v] = cur_level;
-                bits = bits & (bits - 1u);
-            }
+    while (bits != 0u) {
+        let bit_pos = countTrailingZeros(bits);
+        bits = bits & (bits - 1u);
+        let s_pass = s_base + bit_pos;
+        let bank = s_pass >> b_shift;
+        let s_in_bank = s_pass & b_mask;
+        let idx = s_in_bank * nv + v;
+        switch (bank) {
+            case 0u: { dist_bank0[idx] = cur_level; }
+            case 1u: { dist_bank1[idx] = cur_level; }
+            case 2u: { dist_bank2[idx] = cur_level; }
+            case 3u: { dist_bank3[idx] = cur_level; }
+            case 4u: { dist_bank4[idx] = cur_level; }
+            case 5u: { dist_bank5[idx] = cur_level; }
+            case 6u: { dist_bank6[idx] = cur_level; }
+            case 7u: { dist_bank7[idx] = cur_level; }
+            default: {}
         }
-        case 1u: {
-            while (bits != 0u) {
-                let bit_pos = countTrailingZeros(bits);
-                dist_bank1[(w_offset + bit_pos) * nv + v] = cur_level;
-                bits = bits & (bits - 1u);
-            }
-        }
-        case 2u: {
-            while (bits != 0u) {
-                let bit_pos = countTrailingZeros(bits);
-                dist_bank2[(w_offset + bit_pos) * nv + v] = cur_level;
-                bits = bits & (bits - 1u);
-            }
-        }
-        case 3u: {
-            while (bits != 0u) {
-                let bit_pos = countTrailingZeros(bits);
-                dist_bank3[(w_offset + bit_pos) * nv + v] = cur_level;
-                bits = bits & (bits - 1u);
-            }
-        }
-        case 4u: {
-            while (bits != 0u) {
-                let bit_pos = countTrailingZeros(bits);
-                dist_bank4[(w_offset + bit_pos) * nv + v] = cur_level;
-                bits = bits & (bits - 1u);
-            }
-        }
-        case 5u: {
-            while (bits != 0u) {
-                let bit_pos = countTrailingZeros(bits);
-                dist_bank5[(w_offset + bit_pos) * nv + v] = cur_level;
-                bits = bits & (bits - 1u);
-            }
-        }
-        case 6u: {
-            while (bits != 0u) {
-                let bit_pos = countTrailingZeros(bits);
-                dist_bank6[(w_offset + bit_pos) * nv + v] = cur_level;
-                bits = bits & (bits - 1u);
-            }
-        }
-        case 7u: {
-            while (bits != 0u) {
-                let bit_pos = countTrailingZeros(bits);
-                dist_bank7[(w_offset + bit_pos) * nv + v] = cur_level;
-                bits = bits & (bits - 1u);
-            }
-        }
-        default: {}
     }
 }
 
@@ -155,8 +122,7 @@ fn process_neighbor(
 
         newly_discovered = true;
 
-        let bank = w >> 1u;
-        write_bank_bits(bank, w, newly, v, nv, cur_level);
+        write_bank_bits(w, newly, v, nv, cur_level);
 
         let v_out_idx = out_frontier_base + v * MAX_WORDS + w;
         atomicOr(&frontiers[v_out_idx], newly);
@@ -180,7 +146,8 @@ fn process_neighbor(
 @compute @workgroup_size(WG_SIZE)
 fn main(
     @builtin(workgroup_id) group_id: vec3<u32>,
-    @builtin(local_invocation_id) local_id: vec3<u32>
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+    @builtin(num_workgroups) num_groups: vec3<u32>
 ) {
     let nv = uniforms.num_vertices;
     let in_slot = state.ping_pong_out;
@@ -211,8 +178,12 @@ fn main(
     }
     workgroupBarrier();
 
+    // Milestone M24: 2D Grid Dispatch support for queues > 65,535 workgroups (> 1,048,560 vertices)
+    let stride = select(num_groups.x, 256u, num_groups.x == 0u);
+    let wg_id = group_id.x + group_id.y * stride;
+
     // Phase 0: Sub-warps cooperatively load vertices from input queue into LDS
-    let in_queue_idx = group_id.x * NUM_SUB_WARPS + sub_id;
+    let in_queue_idx = wg_id * NUM_SUB_WARPS + sub_id;
     if (in_queue_idx < in_size) {
         let u = queues[in_queue_base + in_queue_idx];
         if (u < nv) {

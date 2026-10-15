@@ -148,7 +148,8 @@ fn process_neighbor(
 @compute @workgroup_size(WG_SIZE)
 fn main(
     @builtin(workgroup_id) group_id: vec3<u32>,
-    @builtin(local_invocation_id) local_id: vec3<u32>
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+    @builtin(num_workgroups) num_groups: vec3<u32>
 ) {
     let nv = uniforms.num_vertices;
     let in_slot = state.ping_pong_out;
@@ -179,8 +180,12 @@ fn main(
     }
     workgroupBarrier();
 
+    // Milestone M24: 2D Grid Dispatch support for queues > 65,535 workgroups (> 1,048,560 vertices)
+    let stride = select(num_groups.x, 256u, num_groups.x == 0u);
+    let wg_id = group_id.x + group_id.y * stride;
+
     // Phase 0: Sub-warps cooperatively load vertices from input queue into LDS
-    let in_queue_idx = group_id.x * NUM_SUB_WARPS + sub_id;
+    let in_queue_idx = wg_id * NUM_SUB_WARPS + sub_id;
     if (in_queue_idx < in_size) {
         let u = queues[in_queue_base + in_queue_idx];
         if (u < nv) {

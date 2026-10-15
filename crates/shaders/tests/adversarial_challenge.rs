@@ -2,9 +2,7 @@
 //! Adversarial stress test suite for WGSL shaders in webgpu-bfs.
 //! Validates Naga compilation, WebGPU compute resource limits, LDS bounds, and binding soundness.
 
-use naga::{
-    AddressSpace, ArraySize, Handle, Module, ShaderStage, StorageAccess, Type, TypeInner,
-};
+use naga::{AddressSpace, ArraySize, Handle, Module, ShaderStage, StorageAccess, Type, TypeInner};
 use std::collections::HashSet;
 use webgpu_bfs_shaders::*;
 
@@ -66,8 +64,8 @@ fn test_adversarial_all_shaders_registered_and_valid() {
     let shaders = all_shaders();
     assert_eq!(
         shaders.len(),
-        27,
-        "Expected exactly 27 embedded shaders, but found {}",
+        32,
+        "Expected exactly 32 embedded shaders, but found {}",
         shaders.len()
     );
 
@@ -245,8 +243,7 @@ fn test_adversarial_atomic_variable_placement() {
                 assert!(
                     valid_space,
                     "Shader '{}' declares atomic variable in invalid address space {:?}",
-                    name,
-                    global.space
+                    name, global.space
                 );
             }
         }

@@ -14,13 +14,10 @@
 
 use anyhow::{Context, Result};
 use std::sync::Arc;
-use webgpu_bfs_core::CsrGraph;
+use webgpu_bfs_core::{CsrGraph, ReachabilityBitmask};
 use wgpu::util::DeviceExt;
 
-use crate::{
-    context::GpuContext,
-    pipeline::PipelineCache,
-};
+use crate::{context::GpuContext, pipeline::PipelineCache};
 
 /// Initial speculative hops pre-recorded on level 0 (covers power-law / scale-free diameters in 1 pass).
 pub const DEFAULT_MACRO_BATCH_HOPS: usize = 160;
@@ -67,6 +64,83 @@ pub struct IndirectArgs {
     pub workgroups_x: u32,
     pub workgroups_y: u32,
     pub workgroups_z: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct HybridPushUniforms {
+    pub num_vertices: u32,
+    pub chunk_start: u32,
+    pub hub_threshold: u32,
+    pub num_words: u32,
+    pub density_threshold: u32,
+    pub bank_shift: u32,
+    pub bank_mask: u32,
+    pub pad0: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct HybridIterationState {
+    pub level: u32,
+    pub terminated: u32,
+    pub ping_pong_in: u32,
+    pub ping_pong_out: u32,
+    pub current_direction: u32,
+    pub prev_direction: u32,
+    pub pad0: u32,
+    pub pad1: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct HybridIndirectArgs {
+    pub push_x: u32,
+    pub push_y: u32,
+    pub push_z: u32,
+    pub pad0: u32,
+    pub pull_x: u32,
+    pub pull_y: u32,
+    pub pull_z: u32,
+    pub pad1: u32,
+    pub clear_x: u32,
+    pub clear_y: u32,
+    pub clear_z: u32,
+    pub pad2: u32,
+}
+
+pub const PUSH_ARGS_OFFSET: u64 = 0;
+pub const PULL_ARGS_OFFSET: u64 = 16;
+pub const CLEAR_ARGS_OFFSET: u64 = 32;
+
+pub fn calculate_bank_sources(num_vertices: usize) -> usize {
+    if num_vertices == 0 {
+        return 64;
+    }
+    let bytes_per_source = num_vertices * 4;
+    let max_sources = 134_217_728 / bytes_per_source;
+    if max_sources >= 64 {
+        64
+    } else if max_sources >= 32 {
+        32
+    } else if max_sources >= 16 {
+        16
+    } else if max_sources >= 8 {
+        8
+    } else if max_sources >= 4 {
+        4
+    } else if max_sources >= 2 {
+        2
+    } else {
+        1
+    }
+}
+
+pub fn calculate_bank_shift_and_mask(num_vertices: usize) -> (u32, u32) {
+    let sources = calculate_bank_sources(num_vertices) as u32;
+    let shift = sources.trailing_zeros();
+    let mask = sources - 1;
+    (shift, mask)
 }
 
 #[repr(C)]
@@ -188,7 +262,8 @@ impl PersistentSparsePushBuffers {
             mapped_at_creation: false,
         });
 
-        let batch_cap = max_batch_size.max(64);
+        let scaled_cap = calculate_bank_sources(num_vertices);
+        let batch_cap = max_batch_size.min(scaled_cap).max(1);
         let dist_batch_words = batch_cap * num_vertices;
         let dist_batch_bytes = ((dist_batch_words * std::mem::size_of::<u32>()) as u64).max(4);
         let distance_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -222,7 +297,9 @@ impl PersistentSparsePushBuffers {
         let queue_sizes_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("ISQP Queue Sizes Buffer"),
             size: 16,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
@@ -489,11 +566,7 @@ pub struct PersistentSparsePushBuffers256 {
 }
 
 impl PersistentSparsePushBuffers256 {
-    pub fn new(
-        device: &wgpu::Device,
-        pipelines: &PipelineCache,
-        graph: &CsrGraph,
-    ) -> Self {
+    pub fn new(device: &wgpu::Device, pipelines: &PipelineCache, graph: &CsrGraph) -> Self {
         let num_vertices = graph.num_vertices;
         let num_edges = graph.num_edges;
 
@@ -552,7 +625,9 @@ impl PersistentSparsePushBuffers256 {
         let queue_sizes_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("ISQP 256 Queue Sizes Buffer"),
             size: 16,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
@@ -839,6 +914,7 @@ impl PersistentSparsePushBuffers256 {
 pub struct PersistentSparsePushBuffers512 {
     pub num_vertices: usize,
     pub num_edges: usize,
+    pub max_degree: usize,
 
     pub row_ptr_buf: wgpu::Buffer,
     pub col_ind_buf: wgpu::Buffer,
@@ -856,26 +932,25 @@ pub struct PersistentSparsePushBuffers512 {
     pub init_sources_params_buf: wgpu::Buffer,
     pub pack_params_buf: wgpu::Buffer,
     pub staging_status_buf: wgpu::Buffer,
+    pub staging_visited_buf: wgpu::Buffer,
 
     pub dist_banks: [wgpu::Buffer; 8],
     pub packed_u16_banks: [wgpu::Buffer; 8],
-    pub staging_packed_buf: wgpu::Buffer,
+    pub staging_packed_bufs: [wgpu::Buffer; 2],
 
     pub reset_dist_bgs: [wgpu::BindGroup; 8],
     pub init_sources_bg: wgpu::BindGroup,
     pub prep_bg: wgpu::BindGroup,
+    pub prep_hybrid_bg: wgpu::BindGroup,
     pub trav_bg: wgpu::BindGroup,
     pub pack_dist_bgs: [wgpu::BindGroup; 8],
 }
 
 impl PersistentSparsePushBuffers512 {
-    pub fn new(
-        device: &wgpu::Device,
-        pipelines: &PipelineCache,
-        graph: &CsrGraph,
-    ) -> Self {
+    pub fn new(device: &wgpu::Device, pipelines: &PipelineCache, graph: &CsrGraph) -> Self {
         let num_vertices = graph.num_vertices;
         let num_edges = graph.num_edges;
+        let max_degree = graph.max_degree();
 
         let row_ptr_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("ISQP 512 CSR Row Pointers"),
@@ -903,8 +978,8 @@ impl PersistentSparsePushBuffers512 {
             mapped_at_creation: false,
         });
 
-        // 16 words * 2 ping-pong slots = 32 words per vertex
-        let frontiers_bytes = ((32 * num_vertices * std::mem::size_of::<u32>()) as u64).max(4);
+        // 16 words * 2 ping-pong slots = 32 words per vertex (capped at WebGPU 128 MB limit)
+        let frontiers_bytes = (((32 * num_vertices * std::mem::size_of::<u32>()) as u64).min(134_217_728)).max(4);
         let frontiers_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("ISQP 512 Frontiers Buffer"),
             size: frontiers_bytes,
@@ -917,7 +992,16 @@ impl PersistentSparsePushBuffers512 {
         let visited_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("ISQP 512 Visited Buffer"),
             size: visited_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let staging_visited_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ISQP 512 Staging Visited Buffer"),
+            size: visited_bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
@@ -932,13 +1016,15 @@ impl PersistentSparsePushBuffers512 {
         let queue_sizes_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("ISQP 512 Queue Sizes Buffer"),
             size: 16,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
         let state_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("ISQP 512 Iteration State Buffer"),
-            size: 16,
+            size: 32,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::UNIFORM
                 | wgpu::BufferUsages::COPY_SRC
@@ -948,7 +1034,7 @@ impl PersistentSparsePushBuffers512 {
 
         let indirect_args_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("ISQP 512 Indirect Args Buffer"),
-            size: 12,
+            size: 48,
             usage: wgpu::BufferUsages::INDIRECT
                 | wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST,
@@ -957,7 +1043,7 @@ impl PersistentSparsePushBuffers512 {
 
         let uniforms_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("ISQP 512 Push Uniforms Buffer"),
-            size: 16,
+            size: 32,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -992,12 +1078,13 @@ impl PersistentSparsePushBuffers512 {
 
         let staging_status_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("ISQP 512 Staging Status Buffer"),
-            size: 16,
+            size: 32,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
-        let bank_words = 64 * num_vertices;
+        let bank_sources = calculate_bank_sources(num_vertices);
+        let bank_words = bank_sources * num_vertices;
         let bank_bytes = ((bank_words * std::mem::size_of::<u32>()) as u64).max(4);
         let dist_banks: [wgpu::Buffer; 8] = std::array::from_fn(|i| {
             device.create_buffer(&wgpu::BufferDescriptor {
@@ -1023,12 +1110,20 @@ impl PersistentSparsePushBuffers512 {
             })
         });
 
-        let staging_packed_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("ISQP 512 Staging Packed Distance Buffer"),
-            size: 8 * packed_bytes,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let staging_packed_bufs: [wgpu::Buffer; 2] = [
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("ISQP 512 Staging Packed Distance Buffer A"),
+                size: 8 * packed_bytes,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("ISQP 512 Staging Packed Distance Buffer B"),
+                size: 8 * packed_bytes,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+        ];
 
         let reset_dist_bgs: [wgpu::BindGroup; 8] = std::array::from_fn(|i| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1116,6 +1211,29 @@ impl PersistentSparsePushBuffers512 {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
+                    resource: queue_sizes_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let prep_hybrid_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ISQP 512 Prep Hybrid BG"),
+            layout: pipelines.prep_hybrid_hop_layout(),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniforms_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: state_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: indirect_args_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
                     resource: queue_sizes_buf.as_entire_binding(),
                 },
             ],
@@ -1220,6 +1338,7 @@ impl PersistentSparsePushBuffers512 {
         Self {
             num_vertices,
             num_edges,
+            max_degree,
             row_ptr_buf,
             col_ind_buf,
             queues_buf,
@@ -1235,131 +1354,36 @@ impl PersistentSparsePushBuffers512 {
             init_sources_params_buf,
             pack_params_buf,
             staging_status_buf,
+            staging_visited_buf,
             dist_banks,
             packed_u16_banks,
-            staging_packed_buf,
+            staging_packed_bufs,
             reset_dist_bgs,
             init_sources_bg,
             prep_bg,
+            prep_hybrid_bg,
             trav_bg,
             pack_dist_bgs,
         }
     }
 }
 
-fn execute_readback_512(
-    ctx: &GpuContext,
-    pipelines: &PipelineCache,
-    bufs: &PersistentSparsePushBuffers512,
-    num_banks: usize,
-    bank_packed_bytes: u64,
-    bank_packed_words: u32,
-    pack_dx: u32,
-    pack_dy: u32,
-    chunk_start: usize,
-    active_sources: usize,
-    nv: usize,
-    result: &mut [u32],
-) -> Result<()> {
-    let device = ctx.device();
-    let queue = ctx.queue();
-
-    let mut read_enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("ISQP 512 Final Distance Pack & Read Encoder"),
-    });
-
-    for b in 0..num_banks {
-        {
-            let mut pass = read_enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("ISQP 512 Pack Distances Pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(pipelines.pack_distances_pipeline());
-            pass.set_bind_group(0, &bufs.pack_dist_bgs[b], &[]);
-            pass.dispatch_workgroups(pack_dx, pack_dy, 1);
-        }
-
-        read_enc.copy_buffer_to_buffer(
-            &bufs.packed_u16_banks[b],
-            0,
-            &bufs.staging_packed_buf,
-            (b as u64) * bank_packed_bytes,
-            bank_packed_bytes,
-        );
-    }
-
-    queue.submit(Some(read_enc.finish()));
-
-    let total_packed_bytes = (num_banks as u64) * bank_packed_bytes;
-    let slice_packed = bufs.staging_packed_buf.slice(..total_packed_bytes);
-    let (d_tx, d_rx) = futures_channel::oneshot::channel();
-    slice_packed.map_async(wgpu::MapMode::Read, move |res| {
-        let _ = d_tx.send(res);
-    });
-
-    #[cfg(not(target_arch = "wasm32"))]
-    device.poll(wgpu::Maintain::Wait);
-
-    #[cfg(not(target_arch = "wasm32"))]
-    pollster::block_on(d_rx)
-        .context("Staging packed dist buffer map receiver dropped")?
-        .context("Failed to map staging packed dist buffer")?;
-
-    let packed_view = slice_packed.get_mapped_range();
-    let packed_data: &[u32] = bytemuck::cast_slice(&packed_view);
-
-    let start_dst = chunk_start * nv;
-    let active_dst = &mut result[start_dst..start_dst + active_sources * nv];
-    let words_per_bank = bank_packed_words as usize;
-
-    #[cfg(not(target_arch = "wasm32"))]
-    if num_banks == 1 {
-        let needed_words = (active_dst.len() + 1) / 2;
-        unpack_u16_words_to_u32_parallel(&packed_data[..needed_words], active_dst);
-    } else {
-        std::thread::scope(|s| {
-            for (dst_bank, src_bank) in active_dst
-                .chunks_mut(64 * nv)
-                .zip(packed_data[..num_banks * words_per_bank].chunks(words_per_bank))
-            {
-                s.spawn(move || {
-                    let needed_words = (dst_bank.len() + 1) / 2;
-                    unpack_u16_words_to_u32(&src_bank[..needed_words], dst_bank);
-                });
-            }
-        });
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    for (dst_bank, src_bank) in active_dst
-        .chunks_mut(64 * nv)
-        .zip(packed_data[..num_banks * words_per_bank].chunks(words_per_bank))
-    {
-        let needed_words = (dst_bank.len() + 1) / 2;
-        unpack_u16_words_to_u32(&src_bank[..needed_words], dst_bank);
-    }
-
-    drop(packed_view);
-    bufs.staging_packed_buf.unmap();
-    Ok(())
-}
-
-fn run_indirect_sparse_push_512_chunk(
+fn run_traversal_passes_512(
     ctx: &GpuContext,
     pipelines: &PipelineCache,
     bufs: &PersistentSparsePushBuffers512,
     chunk_sources: &[u32],
     nv: u32,
     chunk_start: usize,
-    result: &mut [u32],
-) -> Result<()> {
+) -> Result<u32> {
     let device = ctx.device();
     let queue = ctx.queue();
     let active_sources = chunk_sources.len();
     if active_sources == 0 {
-        return Ok(());
+        return Ok(0);
     }
-    let num_banks = (active_sources + 63) / 64;
+    let bank_sources = calculate_bank_sources(nv as usize);
+    let num_banks = ((active_sources + bank_sources - 1) / bank_sources).min(8);
 
     let mut unique_sources = Vec::with_capacity(active_sources);
     for &src in chunk_sources {
@@ -1377,7 +1401,7 @@ fn run_indirect_sparse_push_512_chunk(
     );
     queue.write_buffer(&bufs.sources_buf, 0, bytemuck::cast_slice(chunk_sources));
 
-    let bank_words = (64 * nv) as usize;
+    let bank_words = (bank_sources * nv as usize) as usize;
     let total_reset_wgs = ((bank_words + 255) / 256) as u32;
     let (reset_dx, reset_dy) = if total_reset_wgs <= 65535 {
         (total_reset_wgs.max(1), 1u32)
@@ -1399,48 +1423,46 @@ fn run_indirect_sparse_push_512_chunk(
         chunk_start: chunk_start as u32,
         pad0: 0,
     };
-    queue.write_buffer(&bufs.init_sources_params_buf, 0, bytemuck::bytes_of(&init_src_p));
+    queue.write_buffer(
+        &bufs.init_sources_params_buf,
+        0,
+        bytemuck::bytes_of(&init_src_p),
+    );
 
     let active_words = ((active_sources + 31) / 32) as u32;
-    let push_uniforms = PushUniforms {
+    let (bank_shift, bank_mask) = calculate_bank_shift_and_mask(nv as usize);
+    let density_threshold = if bufs.max_degree <= 32 {
+        u32::MAX
+    } else {
+        (nv / 16).max(1)
+    };
+    let push_uniforms = HybridPushUniforms {
         num_vertices: nv,
         chunk_start: chunk_start as u32,
         hub_threshold: 128,
         num_words: active_words,
+        density_threshold,
+        bank_shift,
+        bank_mask,
+        pad0: 1,
     };
     queue.write_buffer(&bufs.uniforms_buf, 0, bytemuck::bytes_of(&push_uniforms));
 
-    let init_state = IterationState {
+    let init_state = HybridIterationState {
         level: 0,
         terminated: 0,
         ping_pong_in: 0,
         ping_pong_out: 1,
+        current_direction: 0,
+        prev_direction: 0,
+        pad0: 0,
+        pad1: 0,
     };
     queue.write_buffer(&bufs.state_buf, 0, bytemuck::bytes_of(&init_state));
 
-    let bank_packed_words = ((bank_words + 1) / 2) as u32;
-    let bank_packed_bytes = (bank_packed_words as u64) * 4;
-
-    let pack_wgs = ((bank_packed_words + 255) / 256) as u32;
-    let (pack_dx, pack_dy) = if pack_wgs <= 65535 {
-        (pack_wgs.max(1), 1u32)
-    } else {
-        let dx = 256u32;
-        let dy = (pack_wgs + dx - 1) / dx;
-        (dx, dy)
-    };
-
-    let pack_p = PackParams {
-        total_elements: bank_words as u32,
-        total_packed_words: bank_packed_words,
-        dispatch_x: pack_dx,
-        pad0: 0,
-    };
-    queue.write_buffer(&bufs.pack_params_buf, 0, bytemuck::bytes_of(&pack_p));
-
     let mut level = 0u32;
     let max_hops = nv;
-    let mut distance_read = false;
+    let mut max_traversed_level = 0u32;
 
     while level < max_hops {
         let max_chunk = determine_macro_chunk_hops(level);
@@ -1483,26 +1505,48 @@ fn run_indirect_sparse_push_512_chunk(
                     label: Some("ISQP 512 Prep Pass"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(pipelines.prep_sparse_push_pipeline());
-                pass.set_bind_group(0, &bufs.prep_bg, &[]);
+                pass.set_pipeline(pipelines.prep_hybrid_hop_pipeline());
+                pass.set_bind_group(0, &bufs.prep_hybrid_bg, &[]);
                 pass.dispatch_workgroups(1, 1, 1);
             }
 
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("ISQP 512 Traversal Pass"),
+                    label: Some("ISQP 512 Push Pass"),
                     timestamp_writes: None,
                 });
                 pass.set_pipeline(pipelines.indirect_sparse_push_512_pipeline());
                 pass.set_bind_group(0, &bufs.trav_bg, &[]);
-                pass.dispatch_workgroups_indirect(&bufs.indirect_args_buf, 0);
+                pass.dispatch_workgroups_indirect(&bufs.indirect_args_buf, PUSH_ARGS_OFFSET);
+            }
+
+            if bufs.max_degree > 32 {
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("ISQP 512 Pull Pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(pipelines.indirect_pull_512_pipeline());
+                    pass.set_bind_group(0, &bufs.trav_bg, &[]);
+                    pass.dispatch_workgroups_indirect(&bufs.indirect_args_buf, PULL_ARGS_OFFSET);
+                }
+
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("ISQP 512 Clear Frontier Pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(pipelines.clear_frontier_512_pipeline());
+                    pass.set_bind_group(0, &bufs.trav_bg, &[]);
+                    pass.dispatch_workgroups_indirect(&bufs.indirect_args_buf, CLEAR_ARGS_OFFSET);
+                }
             }
         }
 
-        encoder.copy_buffer_to_buffer(&bufs.state_buf, 0, &bufs.staging_status_buf, 0, 16);
+        encoder.copy_buffer_to_buffer(&bufs.state_buf, 0, &bufs.staging_status_buf, 0, 32);
         queue.submit(Some(encoder.finish()));
 
-        let slice_status = bufs.staging_status_buf.slice(..16);
+        let slice_status = bufs.staging_status_buf.slice(..32);
         let (s_tx, s_rx) = futures_channel::oneshot::channel();
         slice_status.map_async(wgpu::MapMode::Read, move |res| {
             let _ = s_tx.send(res);
@@ -1519,23 +1563,407 @@ fn run_indirect_sparse_push_512_chunk(
         let st_view = slice_status.get_mapped_range();
         let st: &[u32] = bytemuck::cast_slice(&st_view);
         let terminated = st[1];
+        max_traversed_level = st[0];
         drop(st_view);
         bufs.staging_status_buf.unmap();
 
         if terminated != 0 {
-            execute_readback_512(ctx, pipelines, bufs, num_banks, bank_packed_bytes, bank_packed_words, pack_dx, pack_dy, chunk_start, active_sources, nv as usize, result)?;
-            distance_read = true;
-            break;
+            return Ok(max_traversed_level);
         }
 
         level += chunk_len as u32;
     }
 
-    if !distance_read {
-        execute_readback_512(ctx, pipelines, bufs, num_banks, bank_packed_bytes, bank_packed_words, pack_dx, pack_dy, chunk_start, active_sources, nv as usize, result)?;
+    Ok(max_traversed_level)
+}
+
+fn submit_pack_and_dma_512(
+    ctx: &GpuContext,
+    pipelines: &PipelineCache,
+    bufs: &PersistentSparsePushBuffers512,
+    staging_idx: usize,
+    num_banks: usize,
+    bank_words: usize,
+    use_u8: bool,
+) -> (u64, usize) {
+    let device = ctx.device();
+    let queue = ctx.queue();
+
+    let (bank_packed_words, pack_pipeline) = if use_u8 {
+        (
+            ((bank_words + 3) / 4) as u32,
+            pipelines.pack_distances_u8_pipeline(),
+        )
+    } else {
+        (
+            ((bank_words + 1) / 2) as u32,
+            pipelines.pack_distances_pipeline(),
+        )
+    };
+
+    let bank_packed_bytes = (bank_packed_words as u64) * 4;
+    let pack_wgs = ((bank_packed_words + 255) / 256) as u32;
+    let (pack_dx, pack_dy) = if pack_wgs <= 65535 {
+        (pack_wgs.max(1), 1u32)
+    } else {
+        let dx = 256u32;
+        let dy = (pack_wgs + dx - 1) / dx;
+        (dx, dy)
+    };
+
+    let pack_p = PackParams {
+        total_elements: bank_words as u32,
+        total_packed_words: bank_packed_words,
+        dispatch_x: pack_dx,
+        pad0: 0,
+    };
+    queue.write_buffer(&bufs.pack_params_buf, 0, bytemuck::bytes_of(&pack_p));
+
+    let mut read_enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("ISQP 512 Final Distance Pack & Read Encoder"),
+    });
+
+    for b in 0..num_banks {
+        {
+            let mut pass = read_enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("ISQP 512 Pack Distances Pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(pack_pipeline);
+            pass.set_bind_group(0, &bufs.pack_dist_bgs[b], &[]);
+            pass.dispatch_workgroups(pack_dx, pack_dy, 1);
+        }
+
+        read_enc.copy_buffer_to_buffer(
+            &bufs.packed_u16_banks[b],
+            0,
+            &bufs.staging_packed_bufs[staging_idx],
+            (b as u64) * bank_packed_bytes,
+            bank_packed_bytes,
+        );
     }
 
+    queue.submit(Some(read_enc.finish()));
+
+    let total_packed_bytes = (num_banks as u64) * bank_packed_bytes;
+    (total_packed_bytes, bank_packed_words as usize)
+}
+
+fn execute_readback_512(
+    ctx: &GpuContext,
+    pipelines: &PipelineCache,
+    bufs: &PersistentSparsePushBuffers512,
+    staging_idx: usize,
+    num_banks: usize,
+    bank_words: usize,
+    max_level: u32,
+    chunk_start: usize,
+    active_sources: usize,
+    nv: usize,
+    result: &mut [u32],
+) -> Result<()> {
+    let use_u8 = max_level < 255;
+    let (total_packed_bytes, words_per_bank) = submit_pack_and_dma_512(
+        ctx,
+        pipelines,
+        bufs,
+        staging_idx,
+        num_banks,
+        bank_words,
+        use_u8,
+    );
+
+    let slice_packed = bufs.staging_packed_bufs[staging_idx].slice(..total_packed_bytes);
+    let (d_tx, d_rx) = futures_channel::oneshot::channel();
+    slice_packed.map_async(wgpu::MapMode::Read, move |res| {
+        let _ = d_tx.send(res);
+    });
+
+    #[cfg(not(target_arch = "wasm32"))]
+    ctx.device().poll(wgpu::Maintain::Wait);
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pollster::block_on(d_rx)
+        .context("Staging packed dist buffer map receiver dropped")?
+        .context("Failed to map staging packed dist buffer")?;
+
+    let packed_view = slice_packed.get_mapped_range();
+    let packed_data: &[u32] = bytemuck::cast_slice(&packed_view);
+
+    let start_dst = chunk_start * nv;
+    let active_dst = &mut result[start_dst..start_dst + active_sources * nv];
+
+    if use_u8 {
+        #[cfg(not(target_arch = "wasm32"))]
+        if num_banks == 1 {
+            let needed_words = (active_dst.len() + 3) / 4;
+            unpack_u8_words_to_u32_parallel(&packed_data[..needed_words], active_dst);
+        } else {
+            std::thread::scope(|s| {
+                for (dst_bank, src_bank) in active_dst
+                    .chunks_mut(bank_words)
+                    .zip(packed_data[..num_banks * words_per_bank].chunks(words_per_bank))
+                {
+                    s.spawn(move || {
+                        let needed_words = (dst_bank.len() + 3) / 4;
+                        unpack_u8_words_to_u32(&src_bank[..needed_words], dst_bank);
+                    });
+                }
+            });
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        for (dst_bank, src_bank) in active_dst
+            .chunks_mut(bank_words)
+            .zip(packed_data[..num_banks * words_per_bank].chunks(words_per_bank))
+        {
+            let needed_words = (dst_bank.len() + 3) / 4;
+            unpack_u8_words_to_u32(&src_bank[..needed_words], dst_bank);
+        }
+    } else {
+        #[cfg(not(target_arch = "wasm32"))]
+        if num_banks == 1 {
+            let needed_words = (active_dst.len() + 1) / 2;
+            unpack_u16_words_to_u32_parallel(&packed_data[..needed_words], active_dst);
+        } else {
+            std::thread::scope(|s| {
+                for (dst_bank, src_bank) in active_dst
+                    .chunks_mut(bank_words)
+                    .zip(packed_data[..num_banks * words_per_bank].chunks(words_per_bank))
+                {
+                    s.spawn(move || {
+                        let needed_words = (dst_bank.len() + 1) / 2;
+                        unpack_u16_words_to_u32(&src_bank[..needed_words], dst_bank);
+                    });
+                }
+            });
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        for (dst_bank, src_bank) in active_dst
+            .chunks_mut(bank_words)
+            .zip(packed_data[..num_banks * words_per_bank].chunks(words_per_bank))
+        {
+            let needed_words = (dst_bank.len() + 1) / 2;
+            unpack_u16_words_to_u32(&src_bank[..needed_words], dst_bank);
+        }
+    }
+
+    drop(packed_view);
+    bufs.staging_packed_bufs[staging_idx].unmap();
     Ok(())
+}
+
+fn run_indirect_sparse_push_512_chunk(
+    ctx: &GpuContext,
+    pipelines: &PipelineCache,
+    bufs: &PersistentSparsePushBuffers512,
+    chunk_sources: &[u32],
+    nv: u32,
+    chunk_start: usize,
+    result: &mut [u32],
+) -> Result<()> {
+    let active_sources = chunk_sources.len();
+    if active_sources == 0 {
+        return Ok(());
+    }
+    let bank_sources = calculate_bank_sources(nv as usize);
+    let num_banks = ((active_sources + bank_sources - 1) / bank_sources).min(8);
+    let bank_words = (bank_sources * nv as usize) as usize;
+
+    let max_level = run_traversal_passes_512(ctx, pipelines, bufs, chunk_sources, nv, chunk_start)?;
+    execute_readback_512(
+        ctx,
+        pipelines,
+        bufs,
+        0,
+        num_banks,
+        bank_words,
+        max_level,
+        chunk_start,
+        active_sources,
+        nv as usize,
+        result,
+    )
+}
+
+struct PendingUnpack<'scope> {
+    handle: std::thread::ScopedJoinHandle<'scope, Result<wgpu::BufferView<'scope>>>,
+    staging_idx: usize,
+}
+
+pub fn run_indirect_sparse_push_512_pipelined(
+    ctx: &GpuContext,
+    pipelines: &PipelineCache,
+    bufs: &PersistentSparsePushBuffers512,
+    sources: &[u32],
+    nv: u32,
+    result: &mut [u32],
+) -> Result<()> {
+    let chunks: Vec<&[u32]> = sources.chunks(512).collect();
+    let num_chunks = chunks.len();
+
+    if num_chunks <= 1 {
+        if let Some(&first_chunk) = chunks.first() {
+            run_indirect_sparse_push_512_chunk(ctx, pipelines, bufs, first_chunk, nv, 0, result)?;
+        }
+        return Ok(());
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        for (chunk_idx, &chunk_sources) in chunks.iter().enumerate() {
+            let chunk_start = chunk_idx * 512;
+            run_indirect_sparse_push_512_chunk(
+                ctx,
+                pipelines,
+                bufs,
+                chunk_sources,
+                nv,
+                chunk_start,
+                result,
+            )?;
+        }
+        return Ok(());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::thread::scope(|s| -> Result<()> {
+            let mut pending_unpack: Option<PendingUnpack> = None;
+            let mut remaining_result: &mut [u32] = result;
+
+            for (chunk_idx, &chunk_sources) in chunks.iter().enumerate() {
+                let chunk_start = chunk_idx * 512;
+                let active_sources = chunk_sources.len();
+                if active_sources == 0 {
+                    continue;
+                }
+                let this_len = active_sources * (nv as usize);
+                let (active_dst, rest) = remaining_result.split_at_mut(this_len);
+                remaining_result = rest;
+
+                let bank_sources = calculate_bank_sources(nv as usize);
+                let num_banks = ((active_sources + bank_sources - 1) / bank_sources).min(8);
+                let bank_words = (bank_sources * nv as usize) as usize;
+                let staging_idx = chunk_idx % 2;
+
+                // 1. Execute GPU Traversal for chunk_idx.
+                // Concurrency: Runs on GPU while scoped thread concurrently unpacks chunk_idx - 1!
+                let max_level =
+                    run_traversal_passes_512(ctx, pipelines, bufs, chunk_sources, nv, chunk_start)?;
+
+                // 2. Join previous chunk's unpack before reusing its staging buffer.
+                if let Some(pending) = pending_unpack.take() {
+                    let view = pending
+                        .handle
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("CPU unpack worker thread panicked"))??;
+                    drop(view);
+                    bufs.staging_packed_bufs[pending.staging_idx].unmap();
+                }
+
+                // 3. Encode & Submit GPU In-Place Quantization & DMA copy
+                let use_u8 = max_level < 255;
+                let (total_packed_bytes, words_per_bank) = submit_pack_and_dma_512(
+                    ctx,
+                    pipelines,
+                    bufs,
+                    staging_idx,
+                    num_banks,
+                    bank_words,
+                    use_u8,
+                );
+
+                // 4. Map staging buffer asynchronously and wait for mapping
+                let slice_packed =
+                    bufs.staging_packed_bufs[staging_idx].slice(..total_packed_bytes);
+                let (d_tx, d_rx) = futures_channel::oneshot::channel();
+                slice_packed.map_async(wgpu::MapMode::Read, move |res| {
+                    let _ = d_tx.send(res);
+                });
+
+                ctx.device().poll(wgpu::Maintain::Wait);
+
+                pollster::block_on(d_rx)
+                    .context("Staging packed dist buffer map receiver dropped")?
+                    .context("Failed to map staging packed dist buffer")?;
+
+                let packed_view = slice_packed.get_mapped_range();
+
+                // 5. Spawn background host unpack worker for chunk_idx
+                let handle = s.spawn(move || -> Result<wgpu::BufferView<'_>> {
+                    let packed_data: &[u32] = bytemuck::cast_slice(&packed_view);
+                    if use_u8 {
+                        if num_banks == 1 {
+                            let needed_words = (active_dst.len() + 3) / 4;
+                            unpack_u8_words_to_u32_parallel(
+                                &packed_data[..needed_words],
+                                active_dst,
+                            );
+                        } else {
+                            std::thread::scope(|sub_s| {
+                                for (dst_bank, src_bank) in
+                                    active_dst.chunks_mut(bank_words).zip(
+                                        packed_data[..num_banks * words_per_bank]
+                                            .chunks(words_per_bank),
+                                    )
+                                {
+                                    sub_s.spawn(move || {
+                                        let needed_words = (dst_bank.len() + 3) / 4;
+                                        unpack_u8_words_to_u32(&src_bank[..needed_words], dst_bank);
+                                    });
+                                }
+                            });
+                        }
+                    } else {
+                        if num_banks == 1 {
+                            let needed_words = (active_dst.len() + 1) / 2;
+                            unpack_u16_words_to_u32_parallel(
+                                &packed_data[..needed_words],
+                                active_dst,
+                            );
+                        } else {
+                            std::thread::scope(|sub_s| {
+                                for (dst_bank, src_bank) in
+                                    active_dst.chunks_mut(bank_words).zip(
+                                        packed_data[..num_banks * words_per_bank]
+                                            .chunks(words_per_bank),
+                                    )
+                                {
+                                    sub_s.spawn(move || {
+                                        let needed_words = (dst_bank.len() + 1) / 2;
+                                        unpack_u16_words_to_u32(
+                                            &src_bank[..needed_words],
+                                            dst_bank,
+                                        );
+                                    });
+                                }
+                            });
+                        }
+                    }
+                    Ok(packed_view)
+                });
+
+                pending_unpack = Some(PendingUnpack {
+                    handle,
+                    staging_idx,
+                });
+            }
+
+            // 6. Drain final chunk unpack
+            if let Some(pending) = pending_unpack.take() {
+                let view = pending
+                    .handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("CPU unpack worker thread panicked"))??;
+                drop(view);
+                bufs.staging_packed_bufs[pending.staging_idx].unmap();
+            }
+
+            Ok(())
+        })
+    }
 }
 
 fn execute_readback_256(
@@ -1543,10 +1971,8 @@ fn execute_readback_256(
     pipelines: &PipelineCache,
     bufs: &PersistentSparsePushBuffers256,
     num_banks: usize,
-    bank_packed_bytes: u64,
-    bank_packed_words: u32,
-    pack_dx: u32,
-    pack_dy: u32,
+    bank_words: usize,
+    max_level: u32,
     chunk_start: usize,
     active_sources: usize,
     nv: usize,
@@ -1554,6 +1980,37 @@ fn execute_readback_256(
 ) -> Result<()> {
     let device = ctx.device();
     let queue = ctx.queue();
+
+    let use_u8 = max_level < 255;
+    let (bank_packed_words, pack_pipeline) = if use_u8 {
+        (
+            ((bank_words + 3) / 4) as u32,
+            pipelines.pack_distances_u8_pipeline(),
+        )
+    } else {
+        (
+            ((bank_words + 1) / 2) as u32,
+            pipelines.pack_distances_pipeline(),
+        )
+    };
+
+    let bank_packed_bytes = (bank_packed_words as u64) * 4;
+    let pack_wgs = ((bank_packed_words + 255) / 256) as u32;
+    let (pack_dx, pack_dy) = if pack_wgs <= 65535 {
+        (pack_wgs.max(1), 1u32)
+    } else {
+        let dx = 256u32;
+        let dy = (pack_wgs + dx - 1) / dx;
+        (dx, dy)
+    };
+
+    let pack_p = PackParams {
+        total_elements: bank_words as u32,
+        total_packed_words: bank_packed_words,
+        dispatch_x: pack_dx,
+        pad0: 0,
+    };
+    queue.write_buffer(&bufs.pack_params_buf, 0, bytemuck::bytes_of(&pack_p));
 
     let mut read_enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("ISQP 256 Final Distance Pack & Read Encoder"),
@@ -1565,7 +2022,7 @@ fn execute_readback_256(
                 label: Some("ISQP 256 Pack Distances Pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(pipelines.pack_distances_pipeline());
+            pass.set_pipeline(pack_pipeline);
             pass.set_bind_group(0, &bufs.pack_dist_bgs[b], &[]);
             pass.dispatch_workgroups(pack_dx, pack_dy, 1);
         }
@@ -1603,31 +2060,60 @@ fn execute_readback_256(
     let active_dst = &mut result[start_dst..start_dst + active_sources * nv];
     let words_per_bank = bank_packed_words as usize;
 
-    #[cfg(not(target_arch = "wasm32"))]
-    if num_banks == 1 {
-        let needed_words = (active_dst.len() + 1) / 2;
-        unpack_u16_words_to_u32_parallel(&packed_data[..needed_words], active_dst);
-    } else {
-        std::thread::scope(|s| {
-            for (dst_bank, src_bank) in active_dst
-                .chunks_mut(64 * nv)
-                .zip(packed_data[..num_banks * words_per_bank].chunks(words_per_bank))
-            {
-                s.spawn(move || {
-                    let needed_words = (dst_bank.len() + 1) / 2;
-                    unpack_u16_words_to_u32(&src_bank[..needed_words], dst_bank);
-                });
-            }
-        });
-    }
+    if use_u8 {
+        #[cfg(not(target_arch = "wasm32"))]
+        if num_banks == 1 {
+            let needed_words = (active_dst.len() + 3) / 4;
+            unpack_u8_words_to_u32_parallel(&packed_data[..needed_words], active_dst);
+        } else {
+            std::thread::scope(|s| {
+                for (dst_bank, src_bank) in active_dst
+                    .chunks_mut(64 * nv)
+                    .zip(packed_data[..num_banks * words_per_bank].chunks(words_per_bank))
+                {
+                    s.spawn(move || {
+                        let needed_words = (dst_bank.len() + 3) / 4;
+                        unpack_u8_words_to_u32(&src_bank[..needed_words], dst_bank);
+                    });
+                }
+            });
+        }
 
-    #[cfg(target_arch = "wasm32")]
-    for (dst_bank, src_bank) in active_dst
-        .chunks_mut(64 * nv)
-        .zip(packed_data[..num_banks * words_per_bank].chunks(words_per_bank))
-    {
-        let needed_words = (dst_bank.len() + 1) / 2;
-        unpack_u16_words_to_u32(&src_bank[..needed_words], dst_bank);
+        #[cfg(target_arch = "wasm32")]
+        for (dst_bank, src_bank) in active_dst
+            .chunks_mut(64 * nv)
+            .zip(packed_data[..num_banks * words_per_bank].chunks(words_per_bank))
+        {
+            let needed_words = (dst_bank.len() + 3) / 4;
+            unpack_u8_words_to_u32(&src_bank[..needed_words], dst_bank);
+        }
+    } else {
+        #[cfg(not(target_arch = "wasm32"))]
+        if num_banks == 1 {
+            let needed_words = (active_dst.len() + 1) / 2;
+            unpack_u16_words_to_u32_parallel(&packed_data[..needed_words], active_dst);
+        } else {
+            std::thread::scope(|s| {
+                for (dst_bank, src_bank) in active_dst
+                    .chunks_mut(64 * nv)
+                    .zip(packed_data[..num_banks * words_per_bank].chunks(words_per_bank))
+                {
+                    s.spawn(move || {
+                        let needed_words = (dst_bank.len() + 1) / 2;
+                        unpack_u16_words_to_u32(&src_bank[..needed_words], dst_bank);
+                    });
+                }
+            });
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        for (dst_bank, src_bank) in active_dst
+            .chunks_mut(64 * nv)
+            .zip(packed_data[..num_banks * words_per_bank].chunks(words_per_bank))
+        {
+            let needed_words = (dst_bank.len() + 1) / 2;
+            unpack_u16_words_to_u32(&src_bank[..needed_words], dst_bank);
+        }
     }
 
     drop(packed_view);
@@ -1690,7 +2176,11 @@ fn run_indirect_sparse_push_256_chunk(
         chunk_start: chunk_start as u32,
         pad0: 0,
     };
-    queue.write_buffer(&bufs.init_sources_params_buf, 0, bytemuck::bytes_of(&init_src_p));
+    queue.write_buffer(
+        &bufs.init_sources_params_buf,
+        0,
+        bytemuck::bytes_of(&init_src_p),
+    );
 
     let active_words = ((active_sources + 31) / 32) as u32;
     let push_uniforms = PushUniforms {
@@ -1709,29 +2199,10 @@ fn run_indirect_sparse_push_256_chunk(
     };
     queue.write_buffer(&bufs.state_buf, 0, bytemuck::bytes_of(&init_state));
 
-    let bank_packed_words = ((bank_words + 1) / 2) as u32;
-    let bank_packed_bytes = (bank_packed_words as u64) * 4;
-
-    let pack_wgs = ((bank_packed_words + 255) / 256) as u32;
-    let (pack_dx, pack_dy) = if pack_wgs <= 65535 {
-        (pack_wgs.max(1), 1u32)
-    } else {
-        let dx = 256u32;
-        let dy = (pack_wgs + dx - 1) / dx;
-        (dx, dy)
-    };
-
-    let pack_p = PackParams {
-        total_elements: bank_words as u32,
-        total_packed_words: bank_packed_words,
-        dispatch_x: pack_dx,
-        pad0: 0,
-    };
-    queue.write_buffer(&bufs.pack_params_buf, 0, bytemuck::bytes_of(&pack_p));
-
     let mut level = 0u32;
     let max_hops = nv;
     let mut distance_read = false;
+    let mut max_traversed_level = 0u32;
 
     while level < max_hops {
         let max_chunk = determine_macro_chunk_hops(level);
@@ -1810,11 +2281,23 @@ fn run_indirect_sparse_push_256_chunk(
         let st_view = slice_status.get_mapped_range();
         let st: &[u32] = bytemuck::cast_slice(&st_view);
         let terminated = st[1];
+        max_traversed_level = st[0];
         drop(st_view);
         bufs.staging_status_buf.unmap();
 
         if terminated != 0 {
-            execute_readback_256(ctx, pipelines, bufs, num_banks, bank_packed_bytes, bank_packed_words, pack_dx, pack_dy, chunk_start, active_sources, nv as usize, result)?;
+            execute_readback_256(
+                ctx,
+                pipelines,
+                bufs,
+                num_banks,
+                bank_words,
+                max_traversed_level,
+                chunk_start,
+                active_sources,
+                nv as usize,
+                result,
+            )?;
             distance_read = true;
             break;
         }
@@ -1823,7 +2306,18 @@ fn run_indirect_sparse_push_256_chunk(
     }
 
     if !distance_read {
-        execute_readback_256(ctx, pipelines, bufs, num_banks, bank_packed_bytes, bank_packed_words, pack_dx, pack_dy, chunk_start, active_sources, nv as usize, result)?;
+        execute_readback_256(
+            ctx,
+            pipelines,
+            bufs,
+            num_banks,
+            bank_words,
+            max_traversed_level,
+            chunk_start,
+            active_sources,
+            nv as usize,
+            result,
+        )?;
     }
 
     Ok(())
@@ -1863,12 +2357,16 @@ pub fn run_indirect_sparse_push_256_into(
                 None => true,
             };
             if needs_alloc {
-                **opt = Some(PersistentSparsePushBuffers256::new(device, pipelines, graph));
+                **opt = Some(PersistentSparsePushBuffers256::new(
+                    device, pipelines, graph,
+                ));
             }
             opt.as_mut().unwrap()
         }
         None => {
-            local_storage = Some(PersistentSparsePushBuffers256::new(device, pipelines, graph));
+            local_storage = Some(PersistentSparsePushBuffers256::new(
+                device, pipelines, graph,
+            ));
             local_storage.as_mut().unwrap()
         }
     };
@@ -1922,29 +2420,21 @@ pub fn run_indirect_sparse_push_512_into(
                 None => true,
             };
             if needs_alloc {
-                **opt = Some(PersistentSparsePushBuffers512::new(device, pipelines, graph));
+                **opt = Some(PersistentSparsePushBuffers512::new(
+                    device, pipelines, graph,
+                ));
             }
             opt.as_mut().unwrap()
         }
         None => {
-            local_storage = Some(PersistentSparsePushBuffers512::new(device, pipelines, graph));
+            local_storage = Some(PersistentSparsePushBuffers512::new(
+                device, pipelines, graph,
+            ));
             local_storage.as_mut().unwrap()
         }
     };
 
-    for (chunk_idx, chunk_sources) in sources.chunks(512).enumerate() {
-        let chunk_start = chunk_idx * 512;
-        run_indirect_sparse_push_512_chunk(
-            ctx,
-            pipelines,
-            bufs,
-            chunk_sources,
-            nv,
-            chunk_start,
-            result,
-        )?;
-    }
-    Ok(())
+    run_indirect_sparse_push_512_pipelined(ctx, pipelines, bufs, sources, nv, result)
 }
 
 /// Executes Multi-Source BFS using Fused Indirect Sparse Queue Push with default local buffers.
@@ -2013,12 +2503,16 @@ pub fn run_indirect_sparse_push_into(
                 None => true,
             };
             if needs_alloc {
-                **opt = Some(PersistentSparsePushBuffers::new(device, pipelines, graph, 64));
+                **opt = Some(PersistentSparsePushBuffers::new(
+                    device, pipelines, graph, 64,
+                ));
             }
             opt.as_mut().unwrap()
         }
         None => {
-            local_storage = Some(PersistentSparsePushBuffers::new(device, pipelines, graph, 64));
+            local_storage = Some(PersistentSparsePushBuffers::new(
+                device, pipelines, graph, 64,
+            ));
             local_storage.as_mut().unwrap()
         }
     };
@@ -2027,29 +2521,29 @@ pub fn run_indirect_sparse_push_into(
         let pool_512 = match bufs.pool_512.as_mut() {
             Some(p) if p.num_vertices == num_vertices && p.num_edges == graph.num_edges => p,
             _ => {
-                bufs.pool_512 = Some(PersistentSparsePushBuffers512::new(device, pipelines, graph));
+                bufs.pool_512 = Some(PersistentSparsePushBuffers512::new(
+                    device, pipelines, graph,
+                ));
                 bufs.pool_512.as_mut().unwrap()
             }
         };
 
-        for (chunk_idx, chunk_sources) in sources.chunks(512).enumerate() {
-            let chunk_start = chunk_idx * 512;
-            run_indirect_sparse_push_512_chunk(
-                ctx,
-                pipelines,
-                pool_512,
-                chunk_sources,
-                nv,
-                chunk_start,
-                result,
-            )?;
-        }
+        run_indirect_sparse_push_512_pipelined(
+            ctx,
+            pipelines,
+            pool_512,
+            sources,
+            nv,
+            result,
+        )?;
         return Ok(());
     } else if num_sources > 64 {
         let pool_256 = match bufs.pool_256.as_mut() {
             Some(p) if p.num_vertices == num_vertices && p.num_edges == graph.num_edges => p,
             _ => {
-                bufs.pool_256 = Some(PersistentSparsePushBuffers256::new(device, pipelines, graph));
+                bufs.pool_256 = Some(PersistentSparsePushBuffers256::new(
+                    device, pipelines, graph,
+                ));
                 bufs.pool_256.as_mut().unwrap()
             }
         };
@@ -2075,10 +2569,11 @@ pub fn run_indirect_sparse_push_into(
     let trav_pipeline = pipelines.indirect_sparse_push_pipeline();
     let pack_pipeline = pipelines.pack_distances_pipeline();
 
-    // Iterate over sources in chunks of up to 64
-    for (batch_idx, batch_sources) in sources.chunks(64).enumerate() {
+    // Iterate over sources in chunks of up to max_batch_size (scaled for memory limit)
+    let chunk_limit = bufs.max_batch_size;
+    for (batch_idx, batch_sources) in sources.chunks(chunk_limit).enumerate() {
         let batch_size = batch_sources.len();
-        let batch_start = batch_idx * 64;
+        let batch_start = batch_idx * chunk_limit;
 
         // Reset grid geometry: 2D dispatch for exact active elements (batch_size * nv)
         let total_reset_elements = (batch_size * num_vertices) as usize;
@@ -2102,7 +2597,11 @@ pub fn run_indirect_sparse_push_into(
 
         // Write small initialization buffers (total upload < 1 KB across PCIe!)
         queue.write_buffer(&bufs.queues_buf, 0, bytemuck::cast_slice(&unique_sources));
-        queue.write_buffer(&bufs.queue_sizes_buf, 0, bytemuck::cast_slice(&[initial_in_count, 0u32, 0u32, 0u32]));
+        queue.write_buffer(
+            &bufs.queue_sizes_buf,
+            0,
+            bytemuck::cast_slice(&[initial_in_count, 0u32, 0u32, 0u32]),
+        );
         queue.write_buffer(&bufs.sources_buf, 0, bytemuck::cast_slice(batch_sources));
 
         let reset_p = ResetParams {
@@ -2117,7 +2616,11 @@ pub fn run_indirect_sparse_push_into(
             chunk_start: 0,
             pad0: 0,
         };
-        queue.write_buffer(&bufs.init_sources_params_buf, 0, bytemuck::bytes_of(&init_src_p));
+        queue.write_buffer(
+            &bufs.init_sources_params_buf,
+            0,
+            bytemuck::bytes_of(&init_src_p),
+        );
 
         let active_words = if batch_size <= 32 { 1u32 } else { 2u32 };
         let push_uniforms = PushUniforms {
@@ -2140,27 +2643,8 @@ pub fn run_indirect_sparse_push_into(
         let mut level = 0u32;
         let max_hops = nv;
         let batch_elements = batch_size * num_vertices;
-        let total_packed_words = ((batch_elements + 1) / 2) as u32;
-        let packed_bytes = (total_packed_words as u64) * 4;
-
-        let pack_wgs = (total_packed_words + 255) / 256;
-        let (pack_dx, pack_dy) = if pack_wgs <= 65535 {
-            (pack_wgs.max(1), 1u32)
-        } else {
-            let dx = 256u32;
-            let dy = (pack_wgs + dx - 1) / dx;
-            (dx, dy)
-        };
-
-        let pack_p = PackParams {
-            total_elements: batch_elements as u32,
-            total_packed_words,
-            dispatch_x: pack_dx,
-            pad0: 0,
-        };
-        queue.write_buffer(&bufs.pack_params_buf, 0, bytemuck::bytes_of(&pack_p));
-
         let mut distance_read = false;
+        let mut max_traversed_level = 0u32;
 
         while level < max_hops {
             let max_chunk = determine_macro_chunk_hops(level);
@@ -2251,11 +2735,37 @@ pub fn run_indirect_sparse_push_into(
             let st_view = slice_status.get_mapped_range();
             let st: &[u32] = bytemuck::cast_slice(&st_view);
             let terminated = st[1];
+            max_traversed_level = st[0];
             drop(st_view);
             bufs.staging_status_buf.unmap();
 
             if terminated != 0 {
-                // Dedicated read pass: pack u32 -> u16 on GPU (0.38 ms) and copy half the size across PCIe
+                let use_u8 = max_traversed_level < 255;
+                let (cur_packed_words, cur_pack_pipeline) = if use_u8 {
+                    (
+                        ((batch_elements + 3) / 4) as u32,
+                        pipelines.pack_distances_u8_pipeline(),
+                    )
+                } else {
+                    (((batch_elements + 1) / 2) as u32, pack_pipeline)
+                };
+                let cur_packed_bytes = (cur_packed_words as u64) * 4;
+                let cur_pack_wgs = ((cur_packed_words + 255) / 256) as u32;
+                let (cur_pack_dx, cur_pack_dy) = if cur_pack_wgs <= 65535 {
+                    (cur_pack_wgs.max(1), 1u32)
+                } else {
+                    let dx = 256u32;
+                    let dy = (cur_pack_wgs + dx - 1) / dx;
+                    (dx, dy)
+                };
+                let cur_pack_p = PackParams {
+                    total_elements: batch_elements as u32,
+                    total_packed_words: cur_packed_words,
+                    dispatch_x: cur_pack_dx,
+                    pad0: 0,
+                };
+                queue.write_buffer(&bufs.pack_params_buf, 0, bytemuck::bytes_of(&cur_pack_p));
+
                 let mut read_enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("ISQP Final Distance Pack & Read Encoder"),
                 });
@@ -2265,15 +2775,21 @@ pub fn run_indirect_sparse_push_into(
                         label: Some("ISQP Pack Distances Pass"),
                         timestamp_writes: None,
                     });
-                    pass.set_pipeline(pack_pipeline);
+                    pass.set_pipeline(cur_pack_pipeline);
                     pass.set_bind_group(0, &bufs.pack_dist_bg, &[]);
-                    pass.dispatch_workgroups(pack_dx, pack_dy, 1);
+                    pass.dispatch_workgroups(cur_pack_dx, cur_pack_dy, 1);
                 }
 
-                read_enc.copy_buffer_to_buffer(&bufs.packed_u16_buf, 0, &bufs.staging_packed_buf, 0, packed_bytes);
+                read_enc.copy_buffer_to_buffer(
+                    &bufs.packed_u16_buf,
+                    0,
+                    &bufs.staging_packed_buf,
+                    0,
+                    cur_packed_bytes,
+                );
                 queue.submit(Some(read_enc.finish()));
 
-                let slice_packed = bufs.staging_packed_buf.slice(..packed_bytes);
+                let slice_packed = bufs.staging_packed_buf.slice(..cur_packed_bytes);
                 let (d_tx, d_rx) = futures_channel::oneshot::channel();
                 slice_packed.map_async(wgpu::MapMode::Read, move |res| {
                     let _ = d_tx.send(res);
@@ -2291,7 +2807,17 @@ pub fn run_indirect_sparse_push_into(
                 let packed_data: &[u32] = bytemuck::cast_slice(&packed_view);
                 let start_dst = batch_start * num_vertices;
 
-                unpack_u16_words_to_u32_parallel(packed_data, &mut result[start_dst..start_dst + batch_elements]);
+                if use_u8 {
+                    unpack_u8_words_to_u32_parallel(
+                        packed_data,
+                        &mut result[start_dst..start_dst + batch_elements],
+                    );
+                } else {
+                    unpack_u16_words_to_u32_parallel(
+                        packed_data,
+                        &mut result[start_dst..start_dst + batch_elements],
+                    );
+                }
 
                 drop(packed_view);
                 bufs.staging_packed_buf.unmap();
@@ -2303,6 +2829,32 @@ pub fn run_indirect_sparse_push_into(
         }
 
         if !distance_read {
+            let use_u8 = max_traversed_level < 255;
+            let (cur_packed_words, cur_pack_pipeline) = if use_u8 {
+                (
+                    ((batch_elements + 3) / 4) as u32,
+                    pipelines.pack_distances_u8_pipeline(),
+                )
+            } else {
+                (((batch_elements + 1) / 2) as u32, pack_pipeline)
+            };
+            let cur_packed_bytes = (cur_packed_words as u64) * 4;
+            let cur_pack_wgs = ((cur_packed_words + 255) / 256) as u32;
+            let (cur_pack_dx, cur_pack_dy) = if cur_pack_wgs <= 65535 {
+                (cur_pack_wgs.max(1), 1u32)
+            } else {
+                let dx = 256u32;
+                let dy = (cur_pack_wgs + dx - 1) / dx;
+                (dx, dy)
+            };
+            let cur_pack_p = PackParams {
+                total_elements: batch_elements as u32,
+                total_packed_words: cur_packed_words,
+                dispatch_x: cur_pack_dx,
+                pad0: 0,
+            };
+            queue.write_buffer(&bufs.pack_params_buf, 0, bytemuck::bytes_of(&cur_pack_p));
+
             let mut read_enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("ISQP Final Distance Pack & Read Encoder (Max Hops Fallback)"),
             });
@@ -2312,15 +2864,21 @@ pub fn run_indirect_sparse_push_into(
                     label: Some("ISQP Pack Distances Pass (Fallback)"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(pack_pipeline);
+                pass.set_pipeline(cur_pack_pipeline);
                 pass.set_bind_group(0, &bufs.pack_dist_bg, &[]);
-                pass.dispatch_workgroups(pack_dx, pack_dy, 1);
+                pass.dispatch_workgroups(cur_pack_dx, cur_pack_dy, 1);
             }
 
-            read_enc.copy_buffer_to_buffer(&bufs.packed_u16_buf, 0, &bufs.staging_packed_buf, 0, packed_bytes);
+            read_enc.copy_buffer_to_buffer(
+                &bufs.packed_u16_buf,
+                0,
+                &bufs.staging_packed_buf,
+                0,
+                cur_packed_bytes,
+            );
             queue.submit(Some(read_enc.finish()));
 
-            let slice_packed = bufs.staging_packed_buf.slice(..packed_bytes);
+            let slice_packed = bufs.staging_packed_buf.slice(..cur_packed_bytes);
             let (d_tx, d_rx) = futures_channel::oneshot::channel();
             slice_packed.map_async(wgpu::MapMode::Read, move |res| {
                 let _ = d_tx.send(res);
@@ -2338,7 +2896,17 @@ pub fn run_indirect_sparse_push_into(
             let packed_data: &[u32] = bytemuck::cast_slice(&packed_view);
             let start_dst = batch_start * num_vertices;
 
-            unpack_u16_words_to_u32_parallel(packed_data, &mut result[start_dst..start_dst + batch_elements]);
+            if use_u8 {
+                unpack_u8_words_to_u32_parallel(
+                    packed_data,
+                    &mut result[start_dst..start_dst + batch_elements],
+                );
+            } else {
+                unpack_u16_words_to_u32_parallel(
+                    packed_data,
+                    &mut result[start_dst..start_dst + batch_elements],
+                );
+            }
 
             drop(packed_view);
             bufs.staging_packed_buf.unmap();
@@ -2406,4 +2974,199 @@ pub fn unpack_u16_words_to_u32_parallel(packed_words: &[u32], dst: &mut [u32]) {
             }
         });
     }
+}
+
+/// Ultra-fast branchless host unpacking from u8 packed words to u32 canonical distance format.
+/// Preserves exact bitwise parity: unreachable 0xFF maps to u32::MAX (0xFFFFFFFF).
+#[inline]
+pub fn unpack_u8_words_to_u32(packed_words: &[u32], dst: &mut [u32]) {
+    let num_quads = dst.len() / 4;
+    let quads: &mut [[u32; 4]] = bytemuck::cast_slice_mut(&mut dst[..num_quads * 4]);
+    for (i, &word) in packed_words[..num_quads].iter().enumerate() {
+        let b0 = word & 0xFF;
+        let b1 = (word >> 8) & 0xFF;
+        let b2 = (word >> 16) & 0xFF;
+        let b3 = word >> 24;
+
+        let mask0 = ((b0 == 0xFF) as u32).wrapping_neg();
+        let mask1 = ((b1 == 0xFF) as u32).wrapping_neg();
+        let mask2 = ((b2 == 0xFF) as u32).wrapping_neg();
+        let mask3 = ((b3 == 0xFF) as u32).wrapping_neg();
+
+        quads[i] = [b0 | mask0, b1 | mask1, b2 | mask2, b3 | mask3];
+    }
+
+    let remainder = dst.len() % 4;
+    if remainder > 0 {
+        let last_word = packed_words[num_quads];
+        let base = num_quads * 4;
+        let b0 = last_word & 0xFF;
+        let mask0 = ((b0 == 0xFF) as u32).wrapping_neg();
+        dst[base] = b0 | mask0;
+        if remainder > 1 {
+            let b1 = (last_word >> 8) & 0xFF;
+            let mask1 = ((b1 == 0xFF) as u32).wrapping_neg();
+            dst[base + 1] = b1 | mask1;
+        }
+        if remainder > 2 {
+            let b2 = (last_word >> 16) & 0xFF;
+            let mask2 = ((b2 == 0xFF) as u32).wrapping_neg();
+            dst[base + 2] = b2 | mask2;
+        }
+    }
+}
+
+/// Multi-threaded host unpacking from u8 packed words across all CPU cores.
+/// Partitions dst into 4-element aligned chunks so that packed word indices remain aligned.
+pub fn unpack_u8_words_to_u32_parallel(packed_words: &[u32], dst: &mut [u32]) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        unpack_u8_words_to_u32(packed_words, dst);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let total_len = dst.len();
+        if total_len <= 32768 {
+            unpack_u8_words_to_u32(packed_words, dst);
+            return;
+        }
+
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8)
+            .min(16);
+
+        // Ensure chunk length is a multiple of 4 u32 elements
+        let raw_chunk = (total_len + num_threads - 1) / num_threads;
+        let chunk_elements = ((raw_chunk + 3) / 4) * 4;
+        let words_per_chunk = chunk_elements / 4;
+
+        std::thread::scope(|s| {
+            for (chunk_idx, dst_chunk) in dst.chunks_mut(chunk_elements).enumerate() {
+                let word_start = chunk_idx * words_per_chunk;
+                let needed_words = (dst_chunk.len() + 3) / 4;
+                let src_slice = &packed_words[word_start..word_start + needed_words];
+                s.spawn(move || {
+                    unpack_u8_words_to_u32(src_slice, dst_chunk);
+                });
+            }
+        });
+    }
+}
+
+/// Executes Multi-Source Reachability query using Fused Indirect Sparse Queue Push,
+/// returning a compact bitmask directly from GPU visited buffers without distance packing.
+pub fn run_indirect_sparse_push_reachability(
+    ctx: &Arc<GpuContext>,
+    pipelines: &Arc<PipelineCache>,
+    graph: &CsrGraph,
+    sources: &[u32],
+    mut pool: Option<&mut Option<PersistentSparsePushBuffers>>,
+) -> Result<ReachabilityBitmask> {
+    let num_vertices = graph.num_vertices;
+    let num_sources = sources.len();
+
+    if num_sources == 0 || num_vertices == 0 {
+        return Ok(ReachabilityBitmask::zeroed(num_vertices, num_sources));
+    }
+
+    let device = ctx.device();
+    let queue = ctx.queue();
+    let nv = num_vertices as u32;
+
+    let mut local_storage;
+    let bufs: &mut PersistentSparsePushBuffers = match pool {
+        Some(ref mut opt) => {
+            let needs_alloc = match opt.as_ref() {
+                Some(cached) => {
+                    cached.num_vertices != num_vertices || cached.num_edges != graph.num_edges
+                }
+                None => true,
+            };
+            if needs_alloc {
+                let scaled_cap = calculate_bank_sources(num_vertices);
+                **opt = Some(PersistentSparsePushBuffers::new(
+                    device, pipelines, graph, scaled_cap,
+                ));
+            }
+            opt.as_mut().unwrap()
+        }
+        None => {
+            let scaled_cap = calculate_bank_sources(num_vertices);
+            local_storage = Some(PersistentSparsePushBuffers::new(
+                device, pipelines, graph, scaled_cap,
+            ));
+            local_storage.as_mut().unwrap()
+        }
+    };
+
+    let pool_512 = match bufs.pool_512.as_mut() {
+        Some(p) if p.num_vertices == num_vertices && p.num_edges == graph.num_edges => p,
+        _ => {
+            bufs.pool_512 = Some(PersistentSparsePushBuffers512::new(
+                device, pipelines, graph,
+            ));
+            bufs.pool_512.as_mut().unwrap()
+        }
+    };
+
+    let mut bitmask = ReachabilityBitmask::zeroed(num_vertices, num_sources);
+    let chunks: Vec<&[u32]> = sources.chunks(512).collect();
+
+    for (chunk_idx, &chunk_sources) in chunks.iter().enumerate() {
+        let chunk_start = chunk_idx * 512;
+        let active_sources = chunk_sources.len();
+        if active_sources == 0 {
+            continue;
+        }
+
+        let _ = run_traversal_passes_512(ctx, pipelines, pool_512, chunk_sources, nv, chunk_start)?;
+
+        let active_words = active_sources.div_ceil(32);
+        let copy_bytes = (16 * num_vertices * std::mem::size_of::<u32>()) as u64;
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("ISQP Reachability Visited Readback Encoder"),
+        });
+        encoder.copy_buffer_to_buffer(
+            &pool_512.visited_buf,
+            0,
+            &pool_512.staging_visited_buf,
+            0,
+            copy_bytes,
+        );
+        queue.submit(Some(encoder.finish()));
+
+        let slice = pool_512.staging_visited_buf.slice(..copy_bytes);
+        let (tx, rx) = futures_channel::oneshot::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+
+        #[cfg(not(target_arch = "wasm32"))]
+        device.poll(wgpu::Maintain::Wait);
+
+        #[cfg(not(target_arch = "wasm32"))]
+        pollster::block_on(rx)
+            .context("Staging visited buffer map receiver dropped")?
+            .context("Failed to map staging visited buffer")?;
+
+        let view = slice.get_mapped_range();
+        let visited_data: &[u32] = bytemuck::cast_slice(&view);
+
+        let wpv = bitmask.words_per_vertex;
+        let chunk_word_offset = chunk_idx * 16;
+        for v in 0..num_vertices {
+            let v_base = v * 16;
+            let dst_base = v * wpv + chunk_word_offset;
+            bitmask.words[dst_base..dst_base + active_words]
+                .copy_from_slice(&visited_data[v_base..v_base + active_words]);
+        }
+
+        drop(view);
+        pool_512.staging_visited_buf.unmap();
+    }
+
+    Ok(bitmask)
 }

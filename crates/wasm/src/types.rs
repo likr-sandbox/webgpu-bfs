@@ -157,3 +157,71 @@ pub(crate) fn count_traversed_edges(
 pub(crate) fn count_visited_vertices(distances: &[u32]) -> usize {
     distances.iter().filter(|&&d| d != u32::MAX).count()
 }
+
+#[wasm_bindgen]
+pub struct WasmReachabilityResult {
+    words: Vec<u32>,
+    pub num_vertices: usize,
+    pub num_sources: usize,
+    pub words_per_vertex: usize,
+    pub elapsed_ms: f64,
+    pub total_reachable_pairs: usize,
+    method: String,
+}
+
+#[wasm_bindgen]
+impl WasmReachabilityResult {
+    pub fn new(
+        words: Vec<u32>,
+        num_vertices: usize,
+        num_sources: usize,
+        words_per_vertex: usize,
+        elapsed_ms: f64,
+        total_reachable_pairs: usize,
+        method: String,
+    ) -> Self {
+        Self {
+            words,
+            num_vertices,
+            num_sources,
+            words_per_vertex,
+            elapsed_ms,
+            total_reachable_pairs,
+            method,
+        }
+    }
+
+    pub fn words(&self) -> js_sys::Uint32Array {
+        let arr = js_sys::Uint32Array::new_with_length(self.words.len() as u32);
+        arr.copy_from(&self.words);
+        arr
+    }
+
+    pub fn method(&self) -> String {
+        self.method.clone()
+    }
+
+    pub fn is_reachable(&self, source_idx: usize, vertex: u32) -> bool {
+        if source_idx >= self.num_sources
+            || (vertex as usize) >= self.num_vertices
+            || self.words_per_vertex == 0
+        {
+            return false;
+        }
+        let w = source_idx / 32;
+        let bit = 1u32 << (source_idx % 32);
+        (self.words[(vertex as usize) * self.words_per_vertex + w] & bit) != 0
+    }
+
+    pub fn to_json(&self) -> Result<String, JsValue> {
+        let obj = serde_json::json!({
+            "num_vertices": self.num_vertices,
+            "num_sources": self.num_sources,
+            "words_per_vertex": self.words_per_vertex,
+            "elapsed_ms": self.elapsed_ms,
+            "total_reachable_pairs": self.total_reachable_pairs,
+            "method": self.method,
+        });
+        serde_json::to_string(&obj).map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+}

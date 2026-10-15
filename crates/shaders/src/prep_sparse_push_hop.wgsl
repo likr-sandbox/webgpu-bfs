@@ -40,9 +40,16 @@ fn main() {
         indirect_args.workgroups_z = 0u;
     } else {
         // Workgroup processes 16 vertices (64 threads / 4 sub-warp lanes)
-        indirect_args.workgroups_x = (in_count + 15u) / 16u;
-        indirect_args.workgroups_y = 1u;
-        indirect_args.workgroups_z = 1u;
+        let total_wgs = (in_count + 15u) / 16u;
+        if (total_wgs > 65535u) {
+            indirect_args.workgroups_x = 256u;
+            indirect_args.workgroups_y = (total_wgs + 255u) / 256u;
+            indirect_args.workgroups_z = 1u;
+        } else {
+            indirect_args.workgroups_x = total_wgs;
+            indirect_args.workgroups_y = 1u;
+            indirect_args.workgroups_z = 1u;
+        }
 
         // Reset destination queue counter for the upcoming hop
         atomicStore(&queue_sizes[out_slot], 0u);

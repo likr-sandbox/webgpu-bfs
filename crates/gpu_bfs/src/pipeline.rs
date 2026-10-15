@@ -4,13 +4,15 @@ use anyhow::Result;
 use webgpu_bfs_shaders::{
     BATCHED_SPMM_WGSL, BIT_PARALLEL_64_PULL_WGSL, BIT_PARALLEL_64_PUSH_WGSL, BIT_PARALLEL_64_WGSL,
     BIT_PARALLEL_PULL_WGSL, BIT_PARALLEL_PUSH_WGSL, BOOLEAN_REACHABILITY_WGSL,
-    INDIRECT_BP_PULL_WGSL, INDIRECT_SPARSE_PUSH_WGSL, INIT_SPARSE_PUSH_SOURCES_WGSL,
-    MULTI_WORD_BP_FILTER_WGSL, MULTI_WORD_BP_PULL_WGSL, MULTI_WORD_BP_PUSH_WGSL, NAIVE_SPMV_WGSL,
-    PREP_HOP_WGSL, PREP_SPARSE_PUSH_HOP_WGSL, RESET_BUFFER_U32_MAX_WGSL, SPARSE_BP_FILTER_WGSL,
-    SPARSE_BP_PUSH_WGSL, SPARSE_QUEUE_PUSH_WGSL, PACK_DISTANCES_U32_TO_U16_WGSL,
-    INDIRECT_SPARSE_PUSH_256_WGSL, INDIRECT_SPARSE_PUSH_512_WGSL,
+    CLEAR_FRONTIER_512_WGSL, INDIRECT_BP_PULL_WGSL, INDIRECT_PULL_512_WGSL,
+    INDIRECT_SPARSE_PUSH_256_WGSL, INDIRECT_SPARSE_PUSH_512_WGSL, INDIRECT_SPARSE_PUSH_WGSL,
     INIT_SPARSE_PUSH_SOURCES_256_WGSL, INIT_SPARSE_PUSH_SOURCES_512_WGSL,
-    MULTI_WORD_BP_PULL_512_WGSL,
+    INIT_SPARSE_PUSH_SOURCES_WGSL, MULTI_WORD_BP_FILTER_WGSL, MULTI_WORD_BP_PULL_512_WGSL,
+    MULTI_WORD_BP_PULL_WGSL, MULTI_WORD_BP_PUSH_WGSL, NAIVE_SPMV_WGSL,
+    PACK_DISTANCES_U32_TO_U16_WGSL, PACK_DISTANCES_U32_TO_U8_WGSL, PREP_HOP_WGSL,
+    PREP_HYBRID_HOP_WGSL, PREP_SPARSE_PUSH_HOP_WGSL, RESET_BUFFER_U32_MAX_WGSL,
+    SPARSE_BP_FILTER_WGSL, SPARSE_BP_PUSH_WGSL, SPARSE_QUEUE_PUSH_WGSL,
+    WORKGROUP_PERSISTENT_BFS_WGSL,
 };
 use wgpu::{
     BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType,
@@ -87,9 +89,10 @@ pub struct PipelineCache {
     init_sparse_sources_layout: BindGroupLayout,
     init_sparse_sources_pipeline: ComputePipeline,
 
-    // Milestone 14: Distance Quantization (u32 -> u16)
+    // Milestone 14: Distance Quantization (u32 -> u16, u32 -> u8)
     pack_distances_layout: BindGroupLayout,
     pack_distances_pipeline: ComputePipeline,
+    pack_distances_u8_pipeline: ComputePipeline,
 
     // Milestone 17: Multi-Word Sparse Push Pipelines (256 & 512 width)
     indirect_sparse_push_256_layout: BindGroupLayout,
@@ -105,6 +108,16 @@ pub struct PipelineCache {
     // Milestone 19: Multi-Word Bit-Parallel Pull Pipeline (512 width, 8 Distance Banks)
     multi_word_bp_pull_512_layout: BindGroupLayout,
     multi_word_bp_pull_512_pipeline: ComputePipeline,
+
+    // Milestone 25: GPU-Autonomous Hybrid Direction-Optimizing Traversal
+    prep_hybrid_hop_layout: BindGroupLayout,
+    prep_hybrid_hop_pipeline: ComputePipeline,
+    indirect_pull_512_pipeline: ComputePipeline,
+    clear_frontier_512_pipeline: ComputePipeline,
+
+    // Milestone 26: Autonomous Workgroup-Persistent BFS (1 Workgroup = 1 Source)
+    workgroup_persistent_bfs_layout: BindGroupLayout,
+    workgroup_persistent_bfs_pipeline: ComputePipeline,
 }
 
 impl PipelineCache {
@@ -244,15 +257,15 @@ impl PipelineCache {
         let sparse_bp_push_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("sparse_bp_push_bgl"),
             entries: &[
-                Self::bgl_uniform(0),     // params: PushParams
-                Self::bgl_storage_ro(1),  // row_ptr
-                Self::bgl_storage_ro(2),  // col_ind
-                Self::bgl_storage_ro(3),  // queue_in
-                Self::bgl_storage_rw(4),  // curr_frontier
-                Self::bgl_storage_rw(5),  // next_candidate
-                Self::bgl_storage_rw(6),  // touched
-                Self::bgl_storage_rw(7),  // candidate_queue
-                Self::bgl_storage_rw(8),  // queue_sizes
+                Self::bgl_uniform(0),    // params: PushParams
+                Self::bgl_storage_ro(1), // row_ptr
+                Self::bgl_storage_ro(2), // col_ind
+                Self::bgl_storage_ro(3), // queue_in
+                Self::bgl_storage_rw(4), // curr_frontier
+                Self::bgl_storage_rw(5), // next_candidate
+                Self::bgl_storage_rw(6), // touched
+                Self::bgl_storage_rw(7), // candidate_queue
+                Self::bgl_storage_rw(8), // queue_sizes
             ],
         });
 
@@ -267,15 +280,15 @@ impl PipelineCache {
         let sparse_bp_filter_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("sparse_bp_filter_bgl"),
             entries: &[
-                Self::bgl_uniform(0),     // params: FilterParams
-                Self::bgl_storage_ro(1),  // candidate_queue
-                Self::bgl_storage_rw(2),  // next_candidate
-                Self::bgl_storage_rw(3),  // visited
-                Self::bgl_storage_rw(4),  // next_frontier
-                Self::bgl_storage_rw(5),  // distance
-                Self::bgl_storage_rw(6),  // touched
-                Self::bgl_storage_rw(7),  // queue_out
-                Self::bgl_storage_rw(8),  // queue_sizes
+                Self::bgl_uniform(0),    // params: FilterParams
+                Self::bgl_storage_ro(1), // candidate_queue
+                Self::bgl_storage_rw(2), // next_candidate
+                Self::bgl_storage_rw(3), // visited
+                Self::bgl_storage_rw(4), // next_frontier
+                Self::bgl_storage_rw(5), // distance
+                Self::bgl_storage_rw(6), // touched
+                Self::bgl_storage_rw(7), // queue_out
+                Self::bgl_storage_rw(8), // queue_sizes
             ],
         });
 
@@ -290,14 +303,14 @@ impl PipelineCache {
         let multi_word_bp_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("multi_word_bp_bgl"),
             entries: &[
-                Self::bgl_uniform(0),     // params: MultiWordBpParams
-                Self::bgl_storage_ro(1),  // row_offsets (CSC col offsets)
-                Self::bgl_storage_ro(2),  // col_indices (CSC row indices)
-                Self::bgl_storage_ro(3),  // curr_frontier
-                Self::bgl_storage_rw(4),  // visited
-                Self::bgl_storage_rw(5),  // next_frontier
-                Self::bgl_storage_rw(6),  // distance
-                Self::bgl_storage_rw(7),  // active_count
+                Self::bgl_uniform(0),    // params: MultiWordBpParams
+                Self::bgl_storage_ro(1), // row_offsets (CSC col offsets)
+                Self::bgl_storage_ro(2), // col_indices (CSC row indices)
+                Self::bgl_storage_ro(3), // curr_frontier
+                Self::bgl_storage_rw(4), // visited
+                Self::bgl_storage_rw(5), // next_frontier
+                Self::bgl_storage_rw(6), // distance
+                Self::bgl_storage_rw(7), // active_count
             ],
         });
 
@@ -328,14 +341,14 @@ impl PipelineCache {
         let indirect_bp_pull_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("indirect_bp_pull_bgl"),
             entries: &[
-                Self::bgl_uniform(0),     // params: IndirectStaticParams
-                Self::bgl_storage_ro(1),  // row_ptr
-                Self::bgl_storage_ro(2),  // col_ind
-                Self::bgl_storage_ro(3),  // curr_frontier
-                Self::bgl_storage_rw(4),  // visited
-                Self::bgl_storage_rw(5),  // next_frontier
-                Self::bgl_storage_rw(6),  // distance
-                Self::bgl_storage_rw(7),  // state: IterationState
+                Self::bgl_uniform(0),    // params: IndirectStaticParams
+                Self::bgl_storage_ro(1), // row_ptr
+                Self::bgl_storage_ro(2), // col_ind
+                Self::bgl_storage_ro(3), // curr_frontier
+                Self::bgl_storage_rw(4), // visited
+                Self::bgl_storage_rw(5), // next_frontier
+                Self::bgl_storage_rw(6), // distance
+                Self::bgl_storage_rw(7), // state: IterationState
             ],
         });
 
@@ -363,21 +376,22 @@ impl PipelineCache {
             PREP_SPARSE_PUSH_HOP_WGSL,
         );
 
-        let indirect_sparse_push_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-            label: Some("indirect_sparse_push_bgl"),
-            entries: &[
-                Self::bgl_uniform(0),    // uniforms: PushUniforms
-                Self::bgl_uniform(1),    // state: IterationState
-                Self::bgl_storage_ro(2), // row_ptr
-                Self::bgl_storage_ro(3), // col_ind
-                Self::bgl_storage_rw(4), // queues
-                Self::bgl_storage_rw(5), // frontiers
-                Self::bgl_storage_rw(6), // visited
-                Self::bgl_storage_rw(7), // distance
-                Self::bgl_storage_rw(8), // enqueued
-                Self::bgl_storage_rw(9), // queue_sizes
-            ],
-        });
+        let indirect_sparse_push_layout =
+            device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+                label: Some("indirect_sparse_push_bgl"),
+                entries: &[
+                    Self::bgl_uniform(0),    // uniforms: PushUniforms
+                    Self::bgl_uniform(1),    // state: IterationState
+                    Self::bgl_storage_ro(2), // row_ptr
+                    Self::bgl_storage_ro(3), // col_ind
+                    Self::bgl_storage_rw(4), // queues
+                    Self::bgl_storage_rw(5), // frontiers
+                    Self::bgl_storage_rw(6), // visited
+                    Self::bgl_storage_rw(7), // distance
+                    Self::bgl_storage_rw(8), // enqueued
+                    Self::bgl_storage_rw(9), // queue_sizes
+                ],
+            });
 
         let indirect_sparse_push_pipeline = Self::create_compute_pipeline(
             device,
@@ -405,17 +419,18 @@ impl PipelineCache {
             MULTI_WORD_BP_PUSH_WGSL,
         );
 
-        let multi_word_filter_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-            label: Some("multi_word_filter_bgl"),
-            entries: &[
-                Self::bgl_uniform(0),    // params: FilterParams
-                Self::bgl_storage_rw(1), // next_candidate
-                Self::bgl_storage_rw(2), // visited
-                Self::bgl_storage_rw(3), // next_frontier
-                Self::bgl_storage_rw(4), // distance
-                Self::bgl_storage_rw(5), // active_count
-            ],
-        });
+        let multi_word_filter_layout =
+            device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+                label: Some("multi_word_filter_bgl"),
+                entries: &[
+                    Self::bgl_uniform(0),    // params: FilterParams
+                    Self::bgl_storage_rw(1), // next_candidate
+                    Self::bgl_storage_rw(2), // visited
+                    Self::bgl_storage_rw(3), // next_frontier
+                    Self::bgl_storage_rw(4), // distance
+                    Self::bgl_storage_rw(5), // active_count
+                ],
+            });
 
         let multi_word_filter_pipeline = Self::create_compute_pipeline(
             device,
@@ -440,16 +455,17 @@ impl PipelineCache {
             RESET_BUFFER_U32_MAX_WGSL,
         );
 
-        let init_sparse_sources_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-            label: Some("init_sparse_sources_bgl"),
-            entries: &[
-                Self::bgl_uniform(0),    // params: InitSourcesParams
-                Self::bgl_storage_ro(1), // sources
-                Self::bgl_storage_rw(2), // frontiers
-                Self::bgl_storage_rw(3), // visited
-                Self::bgl_storage_rw(4), // distance
-            ],
-        });
+        let init_sparse_sources_layout =
+            device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+                label: Some("init_sparse_sources_bgl"),
+                entries: &[
+                    Self::bgl_uniform(0),    // params: InitSourcesParams
+                    Self::bgl_storage_ro(1), // sources
+                    Self::bgl_storage_rw(2), // frontiers
+                    Self::bgl_storage_rw(3), // visited
+                    Self::bgl_storage_rw(4), // distance
+                ],
+            });
 
         let init_sparse_sources_pipeline = Self::create_compute_pipeline(
             device,
@@ -473,6 +489,13 @@ impl PipelineCache {
             "pack_distances_pipeline",
             &pack_distances_layout,
             PACK_DISTANCES_U32_TO_U16_WGSL,
+        );
+
+        let pack_distances_u8_pipeline = Self::create_compute_pipeline(
+            device,
+            "pack_distances_u8_pipeline",
+            &pack_distances_layout,
+            PACK_DISTANCES_U32_TO_U8_WGSL,
         );
 
         // Milestone 17: Multi-Word Sparse Push Pipelines (256 & 512 width)
@@ -612,6 +635,70 @@ impl PipelineCache {
             MULTI_WORD_BP_PULL_512_WGSL,
         );
 
+        // Milestone 25: GPU-Autonomous Direction-Optimizing Hybrid Traversal
+        let prep_hybrid_hop_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("prep_hybrid_hop_bgl"),
+            entries: &[
+                Self::bgl_uniform(0),    // uniforms: PushUniforms
+                Self::bgl_storage_rw(1), // state: HybridIterationState
+                Self::bgl_storage_rw(2), // indirect_args: HybridIndirectArgs
+                Self::bgl_storage_rw(3), // queue_sizes: array<atomic<u32>>
+            ],
+        });
+
+        let prep_hybrid_hop_pipeline = Self::create_compute_pipeline(
+            device,
+            "prep_hybrid_hop_pipeline",
+            &prep_hybrid_hop_layout,
+            PREP_HYBRID_HOP_WGSL,
+        );
+
+        let indirect_pull_512_pipeline = Self::create_compute_pipeline(
+            device,
+            "indirect_pull_512_pipeline",
+            &indirect_sparse_push_512_layout,
+            INDIRECT_PULL_512_WGSL,
+        );
+
+        let clear_frontier_512_pipeline = Self::create_compute_pipeline(
+            device,
+            "clear_frontier_512_pipeline",
+            &indirect_sparse_push_512_layout,
+            CLEAR_FRONTIER_512_WGSL,
+        );
+
+        // Milestone 26: Autonomous Workgroup-Persistent BFS (1 Workgroup = 1 Source)
+        // Bindings:
+        // 0: params (uniform)
+        // 1: sources (storage, read)
+        // 2: row_ptr (storage, read)
+        // 3: col_ind (storage, read)
+        // 4: packed_dist (storage, read_write)
+        // 5: vram_visited (storage, read_write)
+        // 6: visited_out_buf (storage, read_write)
+        // 7: overflow_buf (storage, read_write)
+        let workgroup_persistent_bfs_layout =
+            device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+                label: Some("workgroup_persistent_bfs_bgl"),
+                entries: &[
+                    Self::bgl_uniform(0),
+                    Self::bgl_storage_ro(1),
+                    Self::bgl_storage_ro(2),
+                    Self::bgl_storage_ro(3),
+                    Self::bgl_storage_rw(4),
+                    Self::bgl_storage_rw(5),
+                    Self::bgl_storage_rw(6),
+                    Self::bgl_storage_rw(7),
+                ],
+            });
+
+        let workgroup_persistent_bfs_pipeline = Self::create_compute_pipeline(
+            device,
+            "workgroup_persistent_bfs_pipeline",
+            &workgroup_persistent_bfs_layout,
+            WORKGROUP_PERSISTENT_BFS_WGSL,
+        );
+
         Ok(Self {
             naive_layout,
             naive_pipeline,
@@ -653,6 +740,7 @@ impl PipelineCache {
             init_sparse_sources_pipeline,
             pack_distances_layout,
             pack_distances_pipeline,
+            pack_distances_u8_pipeline,
             indirect_sparse_push_256_layout,
             indirect_sparse_push_256_pipeline,
             init_sparse_sources_256_layout,
@@ -663,6 +751,12 @@ impl PipelineCache {
             init_sparse_sources_512_pipeline,
             multi_word_bp_pull_512_layout,
             multi_word_bp_pull_512_pipeline,
+            prep_hybrid_hop_layout,
+            prep_hybrid_hop_pipeline,
+            indirect_pull_512_pipeline,
+            clear_frontier_512_pipeline,
+            workgroup_persistent_bfs_layout,
+            workgroup_persistent_bfs_pipeline,
         })
     }
 
@@ -954,6 +1048,10 @@ impl PipelineCache {
         &self.pack_distances_pipeline
     }
 
+    pub fn pack_distances_u8_pipeline(&self) -> &ComputePipeline {
+        &self.pack_distances_u8_pipeline
+    }
+
     // Milestone 17: Multi-Word Sparse Push Pipelines (256 & 512 width)
     pub fn indirect_sparse_push_256_layout(&self) -> &BindGroupLayout {
         &self.indirect_sparse_push_256_layout
@@ -995,5 +1093,30 @@ impl PipelineCache {
     pub fn multi_word_bp_pull_512_pipeline(&self) -> &ComputePipeline {
         &self.multi_word_bp_pull_512_pipeline
     }
-}
 
+    // Milestone 25: GPU-Autonomous Direction-Optimizing Hybrid Traversal
+    pub fn prep_hybrid_hop_layout(&self) -> &BindGroupLayout {
+        &self.prep_hybrid_hop_layout
+    }
+
+    pub fn prep_hybrid_hop_pipeline(&self) -> &ComputePipeline {
+        &self.prep_hybrid_hop_pipeline
+    }
+
+    pub fn indirect_pull_512_pipeline(&self) -> &ComputePipeline {
+        &self.indirect_pull_512_pipeline
+    }
+
+    pub fn clear_frontier_512_pipeline(&self) -> &ComputePipeline {
+        &self.clear_frontier_512_pipeline
+    }
+
+    // Milestone 26: Autonomous Workgroup-Persistent BFS (1 Workgroup = 1 Source)
+    pub fn workgroup_persistent_bfs_layout(&self) -> &BindGroupLayout {
+        &self.workgroup_persistent_bfs_layout
+    }
+
+    pub fn workgroup_persistent_bfs_pipeline(&self) -> &ComputePipeline {
+        &self.workgroup_persistent_bfs_pipeline
+    }
+}

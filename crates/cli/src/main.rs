@@ -54,7 +54,8 @@ fn run_app(cli: Cli) -> Result<ExitCode> {
                     sources.len()
                 );
 
-                let harness = BenchmarkHarness::new(1, 1, true, args.max_diffs)?;
+                let harness = BenchmarkHarness::new(1, 1, true, args.max_diffs)?
+                    .with_reachability(args.reachability);
                 let suite = harness.run_suite(&graph_name, &graph, &sources, args.method)?;
 
                 render_and_save_report(&suite, args.format, args.output.as_deref())?;
@@ -76,7 +77,8 @@ fn run_app(cli: Cli) -> Result<ExitCode> {
                     load_graph_and_sources(&args.graph, &args.sources)?;
 
                 let harness =
-                    BenchmarkHarness::new(args.warmup, args.iters, args.verify, args.max_diffs)?;
+                    BenchmarkHarness::new(args.warmup, args.iters, args.verify, args.max_diffs)?
+                        .with_reachability(args.reachability);
                 let suite = harness.run_suite(&graph_name, &graph, &sources, args.method)?;
 
                 render_and_save_report(&suite, args.format, args.output.as_deref())?;
@@ -109,7 +111,8 @@ fn execute_run_command(args: RunArgs) -> Result<ExitCode> {
     let iters = if args.bench { args.iters } else { 1 };
     let warmup = if args.bench { args.warmup } else { 0 };
 
-    let harness = BenchmarkHarness::new(warmup, iters, args.verify, args.max_diffs)?;
+    let harness = BenchmarkHarness::new(warmup, iters, args.verify, args.max_diffs)?
+        .with_reachability(args.reachability);
     let suite = harness.run_suite(&graph_name, &graph, &sources, args.method)?;
 
     render_and_save_report(&suite, args.format, args.output.as_deref())?;

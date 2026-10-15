@@ -53,6 +53,18 @@ A high-performance GPU-parallel Multi-Source Breadth-First Search (MS-BFS) libra
 | F20 | Exact Distance Buffer Reset & Word Guarding | Bounding memory reset to actual $S \times \|V\|$ elements, reducing $S=1$ initialization by $64\times$ | M22 | ORIGINAL_REQUEST §R1 |
 | F21 | High-Diameter Scaling & Pull Barrier Elimination | Elimination of all 8 tree barriers/WG, dirty check skipping ~9.6 GB DRAM writes per pass, and $160 \to 512$ hop adaptive scaling | M23 | ORIGINAL_REQUEST §R3 |
 | F22 | Symmetric Graph Buffer Deduplication | Zero-duplicate memory aliasing for CSC/CSR graph topology via `Arc<wgpu::Buffer>` and `from_symmetric_graph` | M23 | ORIGINAL_REQUEST §R1 |
+| F23 | Asynchronous Multi-Buffer Pipeline Overlap | Speculative chunk dispatch overlapping chunk $k+1$ GPU compute with chunk $k$ DMA readback and host CPU unpack | M24 | ORIGINAL_REQUEST §R2 |
+| F24 | Adaptive Chunk-Size Scaling | Multi-tier chunk granularity ($64 \to 128 \to 256$) scaling with batch size and graph scale | M24 | ORIGINAL_REQUEST §R2 |
+| F25 | Topology-Aware Quantization Scaling (u8/u16) | Dynamic quantization selection ($u8$ for $D \le 254$, $u16$ for $D > 254$) cutting readback DMA traffic by up to $2\times$ | M24 | ORIGINAL_REQUEST §R3 |
+| F26 | GPU-Autonomous Direction-Optimizing Hybrid Traversal | GPU-driven dynamic switching between push and pull passes based on in-degree and frontier density without CPU synchronization | M25 | ORIGINAL_REQUEST §R1, §R2 |
+| F27 | Reachability Bitmask API & Engine | `ReachabilityBitmask` and `ReachabilityEngine` trait providing direct 1 bit/pair graph reachability evaluation bypassing distance allocation and u16 quantization | M25 | ORIGINAL_REQUEST §R2, §R3 |
+| F28 | Dynamic Bank Width Scaling | Safe power-of-two bank width scaling ($64 \to 32 \to 16$) maintaining strict $\le 128\text{ MB}$ WebGPU storage buffer compliance on graphs up to $\|V\| > 1,048,576$ | M25 | ORIGINAL_REQUEST §R1 |
+| F29 | WorkgroupPersistentBfs WGSL Shader | Single-dispatch autonomous BFS with 100% on-chip SRAM storage (`s_visited` 14,336B + `s_queue` 2,032B + controls 16B = 16,384B), bit-inverted distance encoding (`inv_d = 0xFFFFu - min(level, 0xFFFFu)`), hardware overflow buffer (`@binding(7) overflow_buf`), and VRAM visited fallback for $|V| > 114,688$ | M26 | ORIGINAL_REQUEST §R1 |
+| F30 | Persistent Dispatcher & Spatial Sorting | `PersistentWorkgroupBfsBuffers` pool, spatial source sorting (by vertex ID for GPU L2 cache residency), double-buffered 2-stage async pipelining (overlapping Chunk $i$ GPU compute with Chunk $i-1$ host CPU unpack), and multithreaded CPU distance unpacking | M26 | ORIGINAL_REQUEST §R1 |
+| F31 | SRAM Reachability Flush & Pull Direct Readback | Cooperative workgroup SRAM-to-VRAM visited flush (`s_visited` to `visited_out_buf`, 14.3 KB/source) and `run_multi_word_bp_reachability` direct `visited_buf` DMA readback | M26 | ORIGINAL_REQUEST §R2 |
+| F32 | Bitmask Conversion Parallelization | Inverted loop order and CPU Rayon parallelization for `ReachabilityBitmask::from_canonical_distances` eliminating CPU cache thrashing | M26 | ORIGINAL_REQUEST §R2 |
+| F33 | Auto Router & Pipeline Cleanups | Low-degree/road network routing (`max_degree <= 8 && num_edges <= 4 * num_vertices`) to `WorkgroupPersistentBfs` across all $S \ge 1$, transparent queue overflow fallback to `MultiWordBitParallel`, pull dispatcher cleanups, hybrid guard | M26 | ORIGINAL_REQUEST §R3 |
+| F34 | Comprehensive Parity & Benchmarking | Workspace test suite verification, 100.0% bitwise parity on `luxembourg_osm` and `web-Stanford` across all batch sizes, empirical defeat of CPU Rayon ($S \ge 16$), and documentation updates | M26 | ORIGINAL_REQUEST §Acceptance |
 
 ---
 
@@ -73,6 +85,9 @@ A high-performance GPU-parallel Multi-Source Breadth-First Search (MS-BFS) libra
 | M21 | Topology Router Verification & Complete Parity | Deterministic `Auto` router testing across degree/batch boundaries, workspace-wide bitwise parity verification | M19, M20 | DONE |
 | M22 | Sparse Push Fractional Batch & Reset Optimization | Single-pass fractional routing ($S=128 < S=256$, $S=384 < S=512$), exact $S \times \|V\|$ reset, M20 horizontal expansion to 256/64 shaders, $S \ge 1$ `Auto` routing | M21 | DONE |
 | M23 | High-Diameter Scaling & Pull Barrier Elimination | 0-barrier & 0-LDS pull kernel, dirty-check ping-pong zeroing, adaptive macro-batching ($160 \to 512$ hops), single final-counter check, `Arc<Buffer>` deduplication | M22 | DONE |
+| M24 | Pipelined Multi-Chunk Execution & Quantization Scaling | Double-buffered GPU/CPU execution overlap, adaptive chunk scaling ($64 \to 256$), dynamic u8/u16 quantization ($2\times$ readback reduction), 2D grid dispatch for massive queues | M23 | DONE |
+| M25 | GPU-Autonomous Hybrid Traversal & Reachability Engine | GPU-autonomous direction-optimizing hybrid traversal (`prep_hybrid_hop.wgsl`, `indirect_pull_512.wgsl`, `clear_frontier_512.wgsl`), `ReachabilityBitmask` & `ReachabilityEngine` API with zero-copy DMA readback, dynamic bank width scaling ($64 \to 32 \to 16$), CLI & WASM integration | M24 | DONE |
+| M26 | WorkgroupPersistentBfs Architecture & Road Network CPU Reversal | 1 workgroup per source autonomous BFS (`workgroup_persistent_bfs.wgsl`), 100% SRAM layout (16 KB limit), bit-inverted distance writes, hardware overflow fallback, spatial source sorting, 2-stage async double-buffering, SRAM reachability flush, auto router integration, and empirical CPU Rayon reversal on `luxembourg_osm` | M25 | DONE |
 
 ---
 
@@ -109,6 +124,18 @@ pub trait BfsEngine {
     /// Source vertices must be 0: dist[s * num_vertices + s] == 0.
     fn run_ms_bfs(&self, graph: &CsrGraph, sources: &[u32]) -> anyhow::Result<Vec<u32>>;
 }
+
+pub struct ReachabilityBitmask {
+    pub num_vertices: usize,
+    pub num_sources: usize,
+    pub words_per_vertex: usize,
+    pub words: Vec<u32>,
+}
+
+pub trait ReachabilityEngine {
+    /// Executes multi-source reachability evaluation, returning a packed 1-bit-per-pair bitmask.
+    fn run_ms_reachability(&self, graph: &CsrGraph, sources: &[u32]) -> anyhow::Result<ReachabilityBitmask>;
+}
 ```
 
 ### `crates/gpu_bfs` Method Selection Enum
@@ -129,9 +156,17 @@ pub enum GpuBfsMethod {
     IndirectMacroBatch,
     IndirectSparseQueuePush,
     MultiWordBitParallelPush,
+    WorkgroupPersistentBfs,
     Auto,
 }
 ```
+
+### `crates/gpu_bfs/src/dispatch/workgroup_persistent.rs`
+- `pub fn run_workgroup_persistent_bfs(device, queue, graph, sources) -> anyhow::Result<Vec<u32>>`
+- `pub fn run_workgroup_persistent_reachability(device, queue, graph, sources) -> anyhow::Result<ReachabilityBitmask>`
+
+### `crates/gpu_bfs/src/dispatch/multi_word_bp.rs`
+- `pub fn run_multi_word_bp_reachability(device, queue, graph, sources) -> anyhow::Result<ReachabilityBitmask>`
 
 ---
 
@@ -152,11 +187,13 @@ pub enum GpuBfsMethod {
   - `bit_parallel_pull.wgsl`
   - `boolean_reachability.wgsl`
   - `bit_parallel_64.wgsl`
+  - `workgroup_persistent_bfs.wgsl`
 - `crates/gpu_bfs/src/`:
   - `context.rs`: WebGPU Instance, Adapter (3-tier fallback), Device, Queue.
   - `buffer.rs`: Storage buffers, staging buffers, mapped readback.
   - `pipeline.rs`: Compute pipeline cache.
   - `engine.rs`: Implementation of `BfsEngine` across all methods.
+  - `dispatch/workgroup_persistent.rs`: Workgroup-persistent autonomous BFS dispatcher.
 - `crates/cli/src/`:
   - `main.rs`: CLI entry point (`clap`), subcommands/flags, benchmark execution, CSV/JSON/MD formatting.
   - `dataset.rs`: SuiteSparse `luxembourg_osm` download & caching.

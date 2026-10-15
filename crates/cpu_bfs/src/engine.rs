@@ -1,5 +1,5 @@
 use crate::{bit_parallel::ms_bfs_bit_parallel, fifo::ms_bfs_fifo, rayon_ms::ms_bfs_rayon};
-use webgpu_bfs_core::{BfsEngine, CsrGraph};
+use webgpu_bfs_core::{BfsEngine, CsrGraph, ReachabilityBitmask, ReachabilityEngine};
 
 /// Algorithmic strategies available for CPU BFS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -68,5 +68,18 @@ impl BfsEngine for CpuBfsEngine {
             CpuBfsAlgorithm::RayonBatched => ms_bfs_rayon(graph, sources),
             CpuBfsAlgorithm::BitParallel64 => ms_bfs_bit_parallel(graph, sources),
         }
+    }
+}
+
+impl ReachabilityEngine for CpuBfsEngine {
+    fn run_reachability(&self, graph: &CsrGraph, sources: &[u32]) -> anyhow::Result<ReachabilityBitmask> {
+        let num_vertices = graph.num_vertices;
+        let num_sources = sources.len();
+        if num_sources == 0 || num_vertices == 0 {
+            return Ok(ReachabilityBitmask::zeroed(num_vertices, num_sources));
+        }
+
+        let distances = self.run_ms_bfs(graph, sources)?;
+        Ok(ReachabilityBitmask::from_canonical_distances(num_vertices, num_sources, &distances))
     }
 }
